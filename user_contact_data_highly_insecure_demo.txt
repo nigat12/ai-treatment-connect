@@ -1,0 +1,46 @@
+--- DEMO Contact Entry: 2025-04-26 19:47:26 ---
+  *** WARNING: Data stored in insecure local text file for demo only. ***
+  Consent Given: False
+  Context:
+    Diagnosis:  Invasive Ductal Carcinoma (Breast Cancer)
+    Stage/Progression:  Stage IIB, node-positive
+    Biomarkers: ER positive, PR positive, HER2 negative
+    Prior Treatment: Lumpectomy, sentinel node biopsy, adjuvant chemotherapy (AC-T)
+    Imaging: Lumpectomy, sentinel node biopsy, adjuvant chemotherapy (AC-T)
+--- End DEMO Entry ---
+
+--- DEMO Contact Entry: 2025-04-26 19:59:24 ---
+  *** WARNING: Data stored in insecure local text file for demo only. ***
+  Consent Given: False
+  Context:
+    Diagnosis:  Invasive Ductal Carcinoma (Breast Cancer)
+    Stage/Progression:  Stage IIB, node-positive
+    Biomarkers: ER positive, PR positive, HER2 negative
+    Prior Treatment: Lumpectomy, sentinel node biopsy, adjuvant chemotherapy (AC-T)
+    Imaging:  Post-treatment mammogram and ultrasound clear
+--- End DEMO Entry ---
+
+--- DEMO Contact Entry: 2025-04-26 20:17:40 ---
+  *** WARNING: Data stored in insecure local text file for demo only. ***
+  Consent Given: False
+  Context:
+    Diagnosis: Non-small cell lung adenocarcinoma
+    Stage/Progression: Stage IV, metastatic to liver and brain
+
+    Biomarkers: EGFR Exon 19 deletion positive
+    Prior Treatment: Carboplatin/Pemetrexed chemotherapy
+    Imaging: Recent CT showed disease progression
+--- End DEMO Entry ---
+
+--- DEMO Contact Entry: 2025-04-26 20:27:40 ---
+  *** WARNING: Data stored in insecure local text file for demo only. ***
+  Consent Given: False
+  Context:
+    Diagnosis: Non-small cell lung adenocarcinoma
+    Stage/Progression: Stage IV, metastatic to liver and brain
+
+    Biomarkers: EGFR Exon 19 deletion positive
+    Prior Treatment: Carboplatin/Pemetrexed chemotherapy
+    Imaging: Recent CT showed disease progression
+--- End DEMO Entry ---
+
