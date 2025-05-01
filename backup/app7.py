@@ -52,8 +52,9 @@ CHAT_CONTAINER_HEIGHT = 600 # Adjust height for chat scroll area in pixels
 AVAILABLE_MODELS = {
     "Llama 3 8B": "llama3-8b-8192",
     "Llama 3 70B": "llama3-70b-8192",
+    "DeepSeek R1 Distill Llama 70B": "deepseek-r1-distill-llama-70b",
     "Gemma 2 Instruct": "gemma2-9b-it",
-    # Add other models as needed
+    "Mistral Saba 24B": "mistral-saba-24b",
 }
 DEFAULT_MODEL_DISPLAY_NAME = "Llama 3 8B"
 
@@ -77,18 +78,18 @@ STAGES = {
 }
 
 STAGE_PROMPTS = {
-    STAGES["INIT"]: "Hi there! I'm an AI assistant designed to help you explore information about cancer treatments using public data. I work alongside your physician and **do not provide medical advice.** Let's start by gathering some information. Please answer the questions as accurately as possible.\n\nFirst: 👇",
-    STAGES["GET_DIAGNOSIS"]: "Q: Kindly share the specific cancer diagnosis? (e.g., Non-small cell lung cancer, Metastatic Breast Cancer)",
+    STAGES["INIT"]: "Hi there! I'm designed to use AI to help you make better treatment decisions alongside your physician. \n\nFirst: 👇",
+    STAGES["GET_DIAGNOSIS"]: "Q: Kindly share your diagnosis? (e.g., lung cancer, Breast Cancer)",
     STAGES["GET_STAGE"]: "Q: Any details on the stage, progression, or spread? (e.g., Stage IV, metastatic to bones, locally advanced)",
     STAGES["GET_BIOMARKERS"]: "Q: Any known biomarker details? (e.g., EGFR Exon 19 deletion, HER2 positive, PD-L1 > 50%). Please list them or type 'None'/'Unknown'.",
     STAGES["GET_PRIOR_TREATMENT"]: "Q: What treatments have been received to date? (e.g., Chemotherapy (Carboplatin/Pemetrexed), Surgery, Immunotherapy (Pembrolizumab), Radiation)",
     STAGES["GET_IMAGING"]: "Q: Are there any recent imaging results (CT, PET, MRI) showing changes or current status? (e.g., Recent CT showed stable disease, PET scan showed progression in liver)",
-    STAGES["ASK_CONSENT"]: "Q: To potentially share more tailored information or allow for follow-up, may we collect your contact details (Name, Email, Phone)?\n\n*_(For this demo, data is saved to a local text file - **this is not secure for real patient data**)._*",
+    STAGES["ASK_CONSENT"]: "Q: Can we share more information about therapeutics that may be relevant to your condition over email or phone?\n",
     STAGES["GET_NAME"]: "Q: Please enter your First and Last Name:",
     STAGES["GET_EMAIL"]: "Q: Please enter your Email Address:",
     STAGES["GET_PHONE"]: "Q: Please enter your Phone Number (optional, press Enter if skipping):",
     STAGES["FINAL_SUMMARY"]: "Generating a final summary based on the gathered information...", # This prompt is immediately followed by the LLM summary
-    STAGES["END"]: "You have reached the end of this exploration session. Feel free to restart if you want to explore a different scenario. Remember to discuss this information with your oncologist."
+    STAGES["END"]: "Thank you for using."
 }
 
 # Helper to get stage name for debug display
@@ -271,85 +272,56 @@ def refine_fda_search_strategy_with_llm(diagnosis, stage_info, markers, model_id
     return strategy
 
 
-def generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, prior_treatment, model_id):
-    """Uses LLM to generate relevant keywords and phrases for ClinicalTrials.gov query.term."""
-    logging.info(f"[LLM Call - CT Keywords] Generating CT.gov keywords for: D='{diagnosis}', S='{stage_info}', M='{biomarkers}', Model={model_id}")
-
+def generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, model_id):
+    """Uses LLM to generate a clean JSON array of keywords and phrases for ClinicalTrials.gov query.term."""
+    
     client = get_llm_client(model_id)
     prompt = f"""
-    Analyze the following cancer information to generate a list of relevant keywords and phrases for searching the ClinicalTrials.gov database using its 'query.term' parameter. This parameter searches across various fields including title, summary, conditions, etc. The API often implicitly ANDs words in this field, and quotes can be used for exact phrases.
-
+    Take the following patient information and build clinicaltrials api query.titles search parameter 
+    return very important keywords connected by term 'OR' 
     User Information:
     Diagnosis: "{diagnosis}"
     Stage/Progression: "{stage_info}"
     Biomarkers: "{biomarkers}"
-    Prior Treatment: "{prior_treatment}"
 
-    Generate a list of keywords and phrases that are most likely to find relevant clinical trials. Include:
+    here is information for you 
+    
     1. The primary cancer type (e.g., "lung cancer", "breast cancer"). Quote multi-word types.
-    2. Relevant specific subtypes (e.g., "non-small cell", "adenocarcinoma"). Quote multi-word subtypes.
+    2. Relevant specific subtypes (e.g., "non-small cell", "adenocarcinoma"). 
     3. Significant biomarkers as quoted phrases or single terms (e.g., "EGFR mutation", "HER2 positive", "PD-L1").
-    4. Relevant status indicators like "recruiting", "active", "not yet recruiting".
-    5. Relevant phase indicators like "phase 2", "phase 3", "phase 4". Quote phases.
-    6. Study type indicators like "interventional study", "clinical trial". Quote multi-word types.
-    7. "metastatic" or related terms if the stage indicates spread.
+    4. "metastatic" or related terms if the stage indicates spread.
 
-    Exclude:
-    - Very general terms unless the input is extremely vague ("cancer" as a last resort).
-    - Treatment types already received (from Prior Treatment).
+    Exclude from the array:
     - Full sentences or questions.
-    - Terms that are unlikely to appear in trial titles, summaries, or conditions.
+    - Any introductory or explanatory text (like "Here is the list...", "Note that...", etc.).
+    - Any conversational elements.
 
-    Prioritize keywords directly related to the diagnosis and biomarkers. Include the status, phase, and type keywords to help find relevant trials by those criteria *via keyword matching*, rather than strict filtering.
+    Output ONLY the SEARCH PARAMETER VALUE
+    AVOID STARTING OR ENDING SENTENCES 
+    DONT COMMENT ON YOUR RESPONSE
+    DONT EXPLAIN YOUR ANSWER 
+    
+    !IMPORTANT ONLY RESPOND THE SEARCH VALUES
 
-    Format the output as a space-separated string of keywords and quoted phrases. Example: "non-small cell lung cancer" "EGFR mutation" metastatic recruiting "phase 3" "interventional study". Do NOT include commas.
-
-    Keywords for query.term:
+    Example output: "Breast Cancer OR STAGE III"
+    
+    Output:
     """
     try:
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are an expert medical terminology assistant generating space-separated keywords and quoted phrases for clinical trial search (query.term)."},
+                {"role": "system", "content": "You are clinicalstrials api search parameter writer."},
                 {"role": "user", "content": prompt}
             ],
-            model=model_id, temperature=0.3, max_tokens=300
+            model=model_id, temperature=0.3, max_tokens=300,
+            
         )
-        keywords_str = clean_text(chat_completion.choices[0].message.content)
-        # The LLM is asked for space-separated keywords/phrases directly,
-        # so we just need to ensure it's not empty or contains unwanted characters.
-        # A simple split by whitespace should work, preserving quotes if LLM adds them.
-        keywords_list = [term.strip() for term in keywords_str.split() if term.strip() and len(term.strip()) > 1]
-        # Ensure basic keywords are present if LLM fails or is too specific
-        if not keywords_list:
-             fallback_keywords = [diagnosis]
-             if biomarkers and biomarkers.lower() not in ['none', 'unknown', 'n/a', '']:
-                fallback_keywords.extend(re.split(r'[,\/\s]+', biomarkers))
-             fallback_keywords.extend(['recruiting', 'phase 2', 'phase 3', 'phase 4', 'interventional'])
-             keywords_list = [f'"{term.strip()}"' if ' ' in term.strip() else term.strip() for term in fallback_keywords if term.strip() and len(term.strip()) > 1] # Quote multi-word fallbacks
+        response_content = chat_completion.choices[0].message.content
+        # logging.info(f"LLM raw CT.gov keywords response: {response_content}")
 
-        logging.info(f"LLM generated CT.gov keywords: {keywords_list}")
-        return keywords_list
-    except (RateLimitError, APIError) as e:
-        logging.error(f"Groq API error (CT keywords): {e}", exc_info=True)
-        st.warning("API error generating ClinicalTrials.gov keywords. Using basic terms.")
-        # Fallback to basic terms if LLM fails
-        fallback_keywords = [diagnosis]
-        if biomarkers and biomarkers.lower() not in ['none', 'unknown', 'n/a', '']:
-            fallback_keywords.extend(re.split(r'[,\/\s]+', biomarkers))
-        fallback_keywords.extend(['recruiting', 'phase 2', 'phase 3', 'phase 4', 'interventional'])
-        # Quote multi-word fallbacks
-        return [f'"{term.strip()}"' if ' ' in term.strip() else term.strip() for term in fallback_keywords if term.strip() and len(term.strip()) > 1]
+        return response_content
     except Exception as e:
-        logging.error(f"Unexpected LLM CT keywords error: {e}", exc_info=True)
-        st.warning("Error generating ClinicalTrials.gov keywords. Using basic terms.")
-        # Fallback to basic terms
-        fallback_keywords = [diagnosis]
-        if biomarkers and biomarkers.lower() not in ['none', 'unknown', 'n/a', '']:
-            fallback_keywords.extend(re.split(r'[,\/\s]+', biomarkers))
-        fallback_keywords.extend(['recruiting', 'phase 2', 'phase 3', 'phase 4', 'interventional'])
-        # Quote multi-word fallbacks
-        return [f'"{term.strip()}"' if ' ' in term.strip() else term.strip() for term in fallback_keywords if term.strip() and len(term.strip()) > 1]
-
+        print("Exception2: ", e)
 
 def generate_drug_summary_llm(diagnosis, markers, fda_drugs, model_id):
     """Generates a concise drug summary from the list of found drugs using LLM."""
@@ -513,7 +485,7 @@ def generate_final_summary_llm(user_inputs, drug_results, trial_results, model_i
     try:
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are an AI assistant providing a final summary of gathered information. Synthesize the provided data concisely and professionally. Include counts and a strong disclaimer about not being medical advice and consulting an oncologist."},
+                {"role": "system", "content": "You are an AI assistant providing a final summary of gathered information. Synthesize the provided data concisely and professionally. Do not provide any comment or descliamer as I handle it manually."},
                 {"role": "user", "content": prompt}
             ],
             model=model_id, temperature=0.3, max_tokens=400
@@ -631,25 +603,28 @@ def search_fda_drugs_for_condition_and_markers(search_strategy, limit=FDA_RESULT
 
 def search_clinical_trials_with_keywords(diagnosis, stage_info, biomarkers, prior_treatment, model_id, limit=CT_REQUEST_LIMIT):
     """
-    Generates keywords using LLM and searches ClinicalTrials.gov V2 API using only query.term.
+    Generates keywords using LLM and searches ClinicalTrials.gov V2 API using only query.term
+    with pagination.
     """
-    logging.info(f"[API Call - CT.gov Keyword] Searching ClinicalTrials.gov for: D='{diagnosis}', S='{stage_info}', M='{biomarkers}'")
-    results = []
+    logging.info(f"[API Call - CT.gov Keyword w/ Pagination] Searching ClinicalTrials.gov for: D='{diagnosis}', S='{stage_info}', M='{biomarkers}'")
+    all_results = []
+    next_page_token = None
+    current_page = 0
+    max_pages = 5 # Safety break to avoid infinite loops, adjust if needed
 
     # --- Use LLM to generate keywords for query.term ---
-    # Call the new LLM function
     # keyword_list = generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, prior_treatment, model_id)
 
     # if not keyword_list:
     #     logging.warning("LLM failed to generate keywords or keywords list is empty. Cannot perform CT.gov search.")
     #     st.warning("Could not generate search terms for ClinicalTrials.gov based on your input.")
-    #     return results # Return empty if no keywords generated
+    #     return all_results # Return empty if no keywords generated
 
     # # Join keywords with spaces for query.term - API handles implicit ANDing of simple terms
     # # LLM is prompted to handle quoting for multi-word phrases
     # query_term_str = " ".join(keyword_list)
     
-    query_term_str = diagnosis + " or " + stage_info + " or " + biomarkers
+    query_term_str = generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, model_id)
 
     logging.info(f"Constructed ClinicalTrials.gov query.term: '{query_term_str}' (from LLM keywords)")
 
@@ -667,134 +642,148 @@ def search_clinical_trials_with_keywords(diagnosis, stage_info, biomarkers, prio
         "LocationList", # ContactsLocationsModule (for snippet)
     ]
 
-    params = {
-        'query.term': query_term_str, # Keywords from LLM
-        # Removed query.filter entirely based on testing issues
-        'pageSize': limit, # Request more than displayed to find best matches
-        'format': 'json',
-        'fields': ",".join(fields_to_request)
-        # Sorting by relevance is default for term queries
-    }
-    logging.info(f"ClinicalTrials.gov Request Params: {params}")
+    # --- Pagination Loop ---
+    while len(all_results) < limit and current_page < max_pages:
+        params = {
+            'query.term': query_term_str, # Keywords from LLM
+            'pageSize': 10, # Request up to remaining limit, max 100 per page
+            'format': 'json',
+            # 'fields': ",".join(fields_to_request)
+        }
+        if next_page_token:
+            params['pageToken'] = next_page_token
 
-    try:
-        response = requests.get(CTGOV_API_V2_BASE_URL, params=params, timeout=30)
+        logging.info(f"CT.gov Requesting Page {current_page + 1} with params: {params}")
 
-        # Handle specific non-200 codes more robustly
-        if response.status_code == 400:
-            logging.error(f"CT.gov API Error (400 Bad Request) for Query: term='{query_term_str}'")
-            try: error_data = response.json(); logging.error(f"API Error Details: {error_data.get('message', error_data)}")
-            except json.JSONDecodeError: logging.error("Could not decode error response body for 400 error.")
-            st.warning("Clinical trial search failed (Bad Request). Please try again or simplify your input.")
-            return [] # Return empty on error
-        elif response.status_code == 404:
-            logging.info(f"No clinical trials found (404) for Query: term='{query_term_str}'")
-            return [] # No results found
-        elif response.status_code == 500:
-             logging.error(f"CT.gov API Error (500 Internal Server Error) for Query: term='{query_term_str}'")
-             try: error_data = response.json(); logging.error(f"API Error Details: {error_data.get('message', error_data)}")
-             except json.JSONDecodeError: logging.error("Could not decode error response body for 500 error.")
-             st.warning("Clinical trial search failed (Internal Server Error). Please try again or simplify your input.")
-             return [] # Return empty on error
+        try:
+            response = requests.get(CTGOV_API_V2_BASE_URL, params=params, timeout=30)
 
-        response.raise_for_status() # Raise for other errors (>=400) not specifically handled
-        data = response.json()
-        processed_results = []
+            # Handle specific non-200 codes more robustly
+            if response.status_code == 400:
+                logging.error(f"CT.gov API Error (400 Bad Request) for Query: term='{query_term_str}'")
+                try: error_data = response.json(); logging.error(f"API Error Details: {error_data.get('message', error_data)}")
+                except json.JSONDecodeError: logging.error("Could not decode error response body for 400 error.")
+                st.warning("Clinical trial search failed (Bad Request). Please try again or simplify your input.")
+                break # Exit loop on error
+            elif response.status_code == 404:
+                logging.info(f"No trials found on page {current_page + 1} (404) for Query: term='{query_term_str}'")
+                break # No more pages/results
+            elif response.status_code == 500:
+                 logging.error(f"CT.gov API Error (500 Internal Server Error) for Query: term='{query_term_str}'")
+                 try: error_data = response.json(); logging.error(f"API Error Details: {error_data.get('message', error_data)}")
+                 except json.JSONDecodeError: logging.error("Could not decode error response body for 500 error.")
+                 st.warning("Clinical trial search failed (Internal Server Error). Results may be incomplete.")
+                 break # Exit loop on error
 
-        studies = data.get('studies', [])
-        logging.info(f"CT.gov API returned {len(studies)} studies raw.")
+            response.raise_for_status() # Raise for other errors (>=400) not specifically handled
 
-        for study in studies:
-            # Extract data based on fields requested and V2 structure
-            protocol = study.get('protocolSection', {})
+            data = response.json()
+            studies_on_page = data.get('studies', [])
+            total_count = data.get('totalCount', 0) # Get total count from response
 
-            # IdentificationModule
-            ident_module = protocol.get('identificationModule', {})
-            nct_id = ident_module.get('nctId', 'N/A')
+            logging.info(f"CT.gov API returned {len(studies_on_page)} studies on page {current_page + 1}. Total count reported: {total_count}.")
 
-            # StatusModule
-            status_module = protocol.get('statusModule', {})
-            status = clean_text(status_module.get('overallStatus', 'N/A'))
+            if not studies_on_page:
+                 logging.info(f"No studies returned on page {current_page + 1}. Ending pagination.")
+                 break # No studies on this page, stop
 
-            # DesignModule
-            design_module = protocol.get('designModule', {})
-            phases_list = design_module.get('phases', ['N/A'])
-            phases = ', '.join(phases_list)
-            study_type = clean_text(design_module.get('studyType', 'N/A'))
+            processed_studies_on_page = []
+            for study in studies_on_page:
+                try:
+                    protocol = study.get('protocolSection', {})
 
-            # ConditionsModule
-            cond_module = protocol.get('conditionsModule', {})
-            conditions = clean_text(', '.join(cond_module.get('conditionList', {}).get('condition', ['N/A'])))
+                    # Safely extract required fields
+                    ident_module = protocol.get('identificationModule', {})
+                    nct_id = ident_module.get('nctId', 'N/A')
+                    title = clean_text(study.get('briefTitle', 'N/A')) # BriefTitle is directly under study
 
-            # DescriptionModule
-            desc_module = protocol.get('descriptionModule', {})
-            brief_summary = clean_text(desc_module.get('briefSummary', 'N/A'), max_len=500) # Longer snippet for summary
+                    status_module = protocol.get('statusModule', {})
+                    status = clean_text(status_module.get('overallStatus', 'N/A'))
 
-            # InterventionModule (InterventionList)
-            int_module = protocol.get('interventionModule', {})
-            interventions_list = int_module.get('interventionList', [])
-            intervention_names = [item.get('interventionName', 'N/A') for item in interventions_list]
-            interventions_str = clean_text(', '.join(intervention_names), max_len=300)
+                    design_module = protocol.get('designModule', {})
+                    phases_list = design_module.get('phases', ['N/A'])
+                    phases = ', '.join(phases_list)
+                    study_type = clean_text(design_module.get('studyType', 'N/A'))
 
-            # EligibilityModule (EligibilityCriteria)
-            elig_module = protocol.get('eligibilityModule', {})
-            eligibility_criteria = clean_text(elig_module.get('eligibilityCriteria', 'N/A'), max_len=400) # Snippet
+                    cond_module = protocol.get('conditionsModule', {})
+                    conditions = clean_text(', '.join(cond_module.get('conditionList', {}).get('condition', ['N/A'])))
 
-            # ContactsLocationsModule (LocationList)
-            loc_module = protocol.get('contactsLocationsModule', {})
-            locations_list = loc_module.get('locationList', [])
-            location_summaries = []
-            for loc in locations_list:
-                 facility = loc.get('location', {}).get('facility', 'N/A')
-                 city = loc.get('location', {}).get('city', 'N/A')
-                 state = loc.get('location', {}).get('state', 'N/A')
-                 country = loc.get('location', {}).get('country', 'N/A')
-                 location_summaries.append(f"{facility}, {city}, {state}, {country}")
-            locations_snippet = clean_text("; ".join(location_summaries), max_len=300)
+                    desc_module = protocol.get('descriptionModule', {})
+                    brief_summary = clean_text(desc_module.get('briefSummary', 'N/A'), max_len=500) # Longer snippet for summary
 
+                    int_module = protocol.get('interventionModule', {})
+                    interventions_list = int_module.get('interventionList', [])
+                    intervention_names = [item.get('interventionName', 'N/A') for item in interventions_list]
+                    interventions_str = clean_text(', '.join(intervention_names), max_len=300)
 
-            # Basic info (BriefTitle is directly under study in V2 examples, not protocolSection)
-            title = clean_text(study.get('briefTitle', 'N/A'))
+                    elig_module = protocol.get('eligibilityModule', {})
+                    eligibility_criteria = clean_text(elig_module.get('eligibilityCriteria', 'N/A'), max_len=400) # Snippet
 
-            url = f"https://clinicaltrials.gov/study/{nct_id}" if nct_id != 'NCTId is missing' else "#"
+                    loc_module = protocol.get('contactsLocationsModule', {})
+                    locations_list = loc_module.get('locationList', [])
+                    location_summaries = []
+                    for loc in locations_list:
+                        facility = loc.get('location', {}).get('facility', 'N/A')
+                        city = loc.get('location', {}).get('city', 'N/A')
+                        state = loc.get('location', {}).get('state', 'N/A')
+                        country = loc.get('location', {}).get('country', 'N/A')
+                        location_summaries.append(f"{facility}, {city}, {state}, {country}")
+                    locations_snippet = clean_text("; ".join(location_summaries), max_len=300)
 
-            processed_results.append({
-                 "nct_id": nct_id,
-                 "title": title,
-                 "status": status,
-                 "phase": phases,
-                 "study_type": study_type,
-                 "conditions": conditions,
-                 "summary": brief_summary,
-                 "interventions": interventions_str,
-                 "eligibility_snippet": eligibility_criteria,
-                 "contact_info": "See Study Link", # Contact details are complex in V2, direct link is best
-                 "locations_snippet": locations_snippet,
-                 "url": url # This URL goes in the expander, not main text
-            })
-        results = processed_results
-        logging.info(f"Successfully processed {len(results)} trials from ClinicalTrials.gov response.")
+                    url = f"https://clinicaltrials.gov/study/{nct_id}" if nct_id != 'N/A' else "#"
 
-    except requests.exceptions.Timeout:
-        logging.error("CT.gov API request timed out.")
-        st.warning("Clinical trial search timed out.")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"CT.gov API request failed: {e}", exc_info=True)
-        st.warning("Could not retrieve trials due to network issue.")
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to decode CT.gov API JSON: {e}", exc_info=True)
-        st.warning("Invalid response received from trial database.")
-    except Exception as e:
-        logging.error(f"Unexpected error processing CT.gov results: {e}", exc_info=True)
-        st.warning("Unexpected error processing trials.")
+                    processed_studies_on_page.append({
+                         "nct_id": nct_id,
+                         "title": title,
+                         "status": status,
+                         "phase": phases,
+                         "study_type": study_type,
+                         "conditions": conditions,
+                         "summary": brief_summary,
+                         "interventions": interventions_str,
+                         "eligibility_snippet": eligibility_criteria,
+                         "contact_info": "See Study Link", # Contact details are complex in V2, direct link is best
+                         "locations_snippet": locations_snippet,
+                         "url": url
+                    })
+                except Exception as e:
+                     logging.error(f"Error processing study {study.get('briefTitle', 'N/A')}: {e}", exc_info=True)
+                     # Continue processing other studies even if one fails
 
-    logging.info(f"ClinicalTrials.gov Search finished. Found {len(results)} results using keyword query: '{query_term_str}'")
-    return results
+            all_results.extend(processed_studies_on_page)
+            logging.info(f"Added {len(processed_studies_on_page)} studies from page {current_page + 1}. Total collected: {len(all_results)}.")
+
+            next_page_token = data.get('nextPageToken')
+            if not next_page_token or len(all_results) >= limit:
+                logging.info("No next page token or limit reached. Ending pagination.")
+                break # No more pages or collected enough results
+
+            current_page += 1 # Increment page counter
+
+        except requests.exceptions.Timeout:
+            logging.error("CT.gov API request timed out.")
+            st.warning("Clinical trial search timed out. Results may be incomplete.")
+            break # Exit loop on timeout
+        except requests.exceptions.RequestException as e:
+            logging.error(f"CT.gov API request failed: {e}", exc_info=True)
+            st.warning("Could not retrieve trials due to network issue. Results may be incomplete.")
+            break # Exit loop on other request errors
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to decode CT.gov API JSON: {e}", exc_info=True)
+            st.warning("Invalid response received from trial database. Results may be incomplete.")
+            break # Exit loop on JSON error
+        except Exception as e:
+            logging.error(f"An unexpected error occurred during CT.gov search: {e}", exc_info=True)
+            st.warning("An unexpected error occurred during clinical trial search. Results may be incomplete.")
+            break # Exit loop on unexpected errors
+
+    logging.info(f"ClinicalTrials.gov Search finished. Found {len(all_results)} results using keyword query: '{query_term_str}'")
+    return all_results[:limit] # Return results up to the specified limit
 
 
 # --- Streamlit App ---
 
-st.set_page_config( page_title="Cancer Treatment Explorer", layout="wide", initial_sidebar_state="expanded" )
+st.set_page_config( page_title="AI Treatment Match", layout="wide", initial_sidebar_state="expanded" )
 
 # --- Initialize Session State ---
 def initialize_session():
@@ -821,9 +810,13 @@ def initialize_session():
         if 'consent_given' not in st.session_state: st.session_state.consent_given = None
         # Add the current prompt if the last message wasn't it (handles refresh on input stages)
         current_prompt_text = STAGE_PROMPTS.get(st.session_state.stage)
-        if current_prompt_text and (not st.session_state.messages or st.session_state.messages[-1].get("content") != current_prompt_text):
-             # Avoid adding prompts for internal processing/end stages if they are already there
-             if st.session_state.stage not in [STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"], STAGES["END"]]:
+        # Avoid adding prompts for internal processing/end stages if they are already there
+        is_processing_stage = st.session_state.stage in [STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]
+        is_end_stage = st.session_state.stage == STAGES["END"]
+
+        # Only append if the message list is empty OR the last message isn't the current prompt AND it's not a processing/end stage
+        if current_prompt_text and not is_processing_stage and not is_end_stage:
+             if not st.session_state.messages or st.session_state.messages[-1].get("content") != current_prompt_text:
                  msg = {"role": "assistant", "content": current_prompt_text}
                  if st.session_state.stage == STAGES["ASK_CONSENT"]: msg["type"] = "buttons"
                  st.session_state.messages.append(msg)
@@ -873,17 +866,17 @@ with st.sidebar:
 # Fixed Header Area
 header_container = st.container()
 with header_container:
-    st.title("🧑‍⚕️ Cancer Treatment Explorer")
-    st.caption("AI-Assisted Public Information Retrieval (Not Medical Advice)")
-    # Add main disclaimer clearly
-    st.markdown(
-        """
-        <div style="padding: 10px; border: 1px solid #ff9900; border-radius: 5px; margin-bottom: 10px; background-color: #fff3e0;">
-            ⚠️ <strong>Disclaimer:</strong> This application provides information based on publicly available data from the FDA and ClinicalTrials.gov. It is intended for informational exploration only and **does not constitute medical advice.** Consult with a qualified healthcare professional for any health concerns or before making any decisions related to your health or treatment.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    st.title("🧑‍⚕️ AI Treatment Match")
+    # st.caption("AI-Assisted Public Information Retrieval (Not Medical Advice)")
+    # # Add main disclaimer clearly
+    # st.markdown(
+    #     """
+    #     <div style="padding: 10px; border: 1px solid #ff9900; border-radius: 5px; margin-bottom: 10px; background-color: #fff3e0;">
+    #         ⚠️ <strong>Disclaimer:</strong> This application provides information based on publicly available data from the FDA and ClinicalTrials.gov. It is intended for informational exploration only and **does not constitute medical advice.** Consult with a qualified healthcare professional for any health concerns or before making any decisions related to your health or treatment.
+    #     </div>
+    #     """,
+    #     unsafe_allow_html=True
+    # )
 
 
 # Scrollable Chat Area
@@ -1071,8 +1064,8 @@ if st.session_state.stage == STAGES["SAVE_CONTACT_SHOW_TRIALS"]:
                 "ImagingResponse": st.session_state.user_inputs.get("imaging", "N/A"),
             }
             if save_user_data(contact_data):
-                st.toast("Contact info recorded (demo purposes only).", icon="✅")
-                st.session_state.messages.append({"role": "assistant", "content": "Thank you! Your contact information has been recorded (for demo purposes)."})
+                st.toast("Contact info recorded.", icon="✅")
+                st.session_state.messages.append({"role": "assistant", "content": "Thank you! Your contact information has been recorded."})
             else:
                 st.toast("Failed to save contact info.", icon="⚠️")
                 st.session_state.messages.append({"role": "assistant", "content": "⚠️ There was an issue recording your contact information."})
@@ -1111,9 +1104,9 @@ if st.session_state.stage == STAGES["SHOW_TRIALS_NO_CONSENT"]: # This stage is r
                 num_to_display = min(num_found, CT_DISPLAY_LIMIT)
                 expander_title = f"View Top {num_to_display} (of {num_found}) Clinical Trial Detail{'s' if num_to_display != 1 else ''}"
                 expander_content = f"**Found {num_found} potentially relevant trial(s), showing top {num_to_display}:**\n\n"
-                # Updated clarification based on using only query.term
-                expander_content += f"*_Search based on AI-generated keywords derived from your input (e.g., diagnosis, markers, stage, 'recruiting', 'phase 2/3/4', 'interventional'). Results are sorted by relevance by the API._*\n"
-                expander_content += f"*_Always verify details, eligibility criteria, and locations on ClinicalTrials.gov via the link._*\n"
+                # Clarification based on using only query.term with LLM keywords
+                # expander_content += f"*_Search based on AI-generated keywords derived from your input (e.g., diagnosis, markers, stage, 'recruiting', 'phase 2/3/4', 'interventional'). Results are sorted by relevance by the API._*\n"
+                # expander_content += f"*_Always verify details, eligibility criteria, and locations on ClinicalTrials.gov via the link._*\n"
 
 
                 for i, trial in enumerate(st.session_state.trial_results[:num_to_display]): # Limit displayed results in expander

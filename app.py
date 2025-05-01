@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
-import requests
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+import re
 import os
 from groq import Groq, RateLimitError, APIError
 from dotenv import load_dotenv
 import json
-import re
-import urllib.parse
 import logging
 from datetime import datetime
 import textwrap
+import math
+import time
+import pickle # For saving/loading index map
 
 # --- Configuration & Setup ---
 
@@ -19,115 +24,139 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Load environment variables
 load_dotenv()
 
-# CRITICAL: Check if Groq API key is loaded BEFORE proceeding
+# CRITICAL: Check if Groq API key is loaded
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 if not GROQ_API_KEY:
-    # Use st.error for user visibility in the app itself
     st.error("🚨 FATAL ERROR: GROQ_API_KEY not found. Please set it in your .env file or environment variables and restart.")
     logging.critical("GROQ_API_KEY not found. Application cannot proceed.")
-    st.stop() # Halt execution
+    st.stop()
 
-# --- API Endpoints ---
-FDA_API_BASE_URL = "https://api.fda.gov/drug/label.json"
-CTGOV_API_V2_BASE_URL = "https://clinicaltrials.gov/api/v2/studies" # Endpoint for studies search
+# --- File Paths ---
+DRUG_DATA_CSV = 'drug_data.csv'
+TRIAL_DATA_XLSX = 'trials.xlsx'
+DRUG_EMBEDDINGS_FILE = 'drug_embeddings.npy'
+TRIAL_EMBEDDINGS_FILE = 'trial_embeddings.npy'
+TRIAL_INDEX_MAP_FILE = 'trial_index_map.pkl'
 
-# --- File Paths (WARNING: Not Secure for Production PII) ---
-# ** SECURITY WARNING: Saving PII to a local text file is INSECURE and NOT SUITABLE
-# ** for production environments handling real patient data. Use a secure database
-# ** and appropriate encryption/access controls in a real application.
-USER_DATA_FILE = "user_contact_data_demo.txt" # For demo purposes ONLY
+# Insecure contact saving path (function retained, warnings removed from UI)
+USER_DATA_FILE = "user_contact_data_demo.txt"
 
-# --- Constants for UI and Logic ---
+# --- Constants for Matching & UI ---
+EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+DRUG_TEXT_COLUMNS_FOR_EMBEDDING = ['Cancer Type']
+TRIAL_TEXT_COLUMNS_FOR_EMBEDDING = ['Conditions']
+
+# Default Thresholds (User configurable via sidebar)
+DRUG_RELEVANCE_THRESHOLD_DEFAULT = 0.50
+TRIAL_RELEVANCE_THRESHOLD_DEFAULT = 0.50
+
+# Trial Filtering Criteria
+TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN = 'Primary Outcome Measures'
+TRIAL_FILTER_PRIMARY_OUTCOME_TERM = 'Overall Survival'
+TRIAL_FILTER_PHASES_COLUMN = 'Phases'
+TRIAL_ACCEPTABLE_PHASES = ['PHASE1|PHASE2', 'PHASE2', 'PHASE2|PHASE3', 'PHASE3', 'PHASE4']
+TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES = set()
+for phase_combo in TRIAL_ACCEPTABLE_PHASES:
+    for phase in re.split(r'[|/,\s]+', phase_combo):
+        if phase: TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES.add(phase.strip().upper())
+
+TRIAL_FILTER_STUDY_TYPE_COLUMN = 'Study Type'
+TRIAL_FILTER_STUDY_TYPE_VALUE = 'INTERVENTIONAL'
+
+# Display Limits
+MAX_DRUGS_TO_DISPLAY = 10
+MAX_TRIALS_TO_DISPLAY = 10
+
+# UI Constants
 ASSISTANT_AVATAR = "🧑‍⚕️"
 USER_AVATAR = "👤"
 ASSISTANT_NAME = "Assistant"
 USER_NAME = "You"
-FDA_RESULT_LIMIT = 15 # Increased limit for FDA results per tier
-FDA_MIN_RESULTS_FOR_NEXT_TIER = 3 # Try next tier if fewer than this found in current tier
-CT_REQUEST_LIMIT = 50 # Request more trials initially from API
-CT_DISPLAY_LIMIT = 15 # Show top N trials to the user
-CHAT_CONTAINER_HEIGHT = 600 # Adjust height for chat scroll area in pixels
+# CHAT_CONTAINER_HEIGHT removed - using single page scroll
 
 # --- Available Groq Models ---
 AVAILABLE_MODELS = {
-    "Llama 3 8B": "llama3-8b-8192",
     "Llama 3 70B": "llama3-70b-8192",
+    "Llama 3 8B": "llama3-8b-8192",
     "DeepSeek R1 Distill Llama 70B": "deepseek-r1-distill-llama-70b",
     "Gemma 2 Instruct": "gemma2-9b-it",
     "Mistral Saba 24B": "mistral-saba-24b",
 }
-DEFAULT_MODEL_DISPLAY_NAME = "Llama 3 8B"
+DEFAULT_MODEL_DISPLAY_NAME = "Llama 3 70B"
+DEFAULT_MODEL_ID = AVAILABLE_MODELS.get(DEFAULT_MODEL_DISPLAY_NAME, list(AVAILABLE_MODELS.values())[0])
 
 # --- Chatbot Questions & Stages ---
 STAGES = {
-    "INIT": 0,
-    "GET_DIAGNOSIS": 1,
-    "GET_STAGE": 2,
-    "GET_BIOMARKERS": 3,
-    "GET_PRIOR_TREATMENT": 4,
-    "GET_IMAGING": 5,
-    "PROCESS_INFO_SHOW_DRUGS": 6, # New stage for processing and showing drugs
-    "ASK_CONSENT": 7,
-    "GET_NAME": 8,
-    "GET_EMAIL": 9,
-    "GET_PHONE": 10,
-    "SAVE_CONTACT_SHOW_TRIALS": 11, # New stage to save contact and then show trials
-    "SHOW_TRIALS_NO_CONSENT": 12, # Stage to show trials if no consent was given
-    "FINAL_SUMMARY": 13, # New stage for the final summary
-    "END": 14
+    "INIT": 0, "GET_DIAGNOSIS": 1, "GET_STAGE": 2, "GET_BIOMARKERS": 3,
+    "GET_PRIOR_TREATMENT": 4, "GET_IMAGING": 5, "PROCESS_INFO_SHOW_DRUGS": 6,
+    "ASK_CONSENT": 7, "GET_NAME": 8, "GET_EMAIL": 9, "GET_PHONE": 10,
+    "SAVE_CONTACT_SHOW_TRIALS": 11, "SHOW_TRIALS_NO_CONSENT": 12,
+    "FINAL_SUMMARY": 13, "END": 14
 }
 
 STAGE_PROMPTS = {
-    STAGES["INIT"]: "Hi there! I'm designed to use AI to help you make better treatment decisions alongside your physician. \n\nFirst: 👇",
-    STAGES["GET_DIAGNOSIS"]: "Q: Kindly share your diagnosis? (e.g., lung cancer, Breast Cancer)",
-    STAGES["GET_STAGE"]: "Q: Any details on the stage, progression, or spread? (e.g., Stage IV, metastatic to bones, locally advanced)",
-    STAGES["GET_BIOMARKERS"]: "Q: Any known biomarker details? (e.g., EGFR Exon 19 deletion, HER2 positive, PD-L1 > 50%). Please list them or type 'None'/'Unknown'.",
-    STAGES["GET_PRIOR_TREATMENT"]: "Q: What treatments have been received to date? (e.g., Chemotherapy (Carboplatin/Pemetrexed), Surgery, Immunotherapy (Pembrolizumab), Radiation)",
-    STAGES["GET_IMAGING"]: "Q: Are there any recent imaging results (CT, PET, MRI) showing changes or current status? (e.g., Recent CT showed stable disease, PET scan showed progression in liver)",
-    STAGES["ASK_CONSENT"]: "Q: Can we share more information about therapeutics that may be relevant to your condition over email or phone?\n",
+    STAGES["INIT"]: "Welcome! I can help explore potential treatment options based on study data. Please provide some details to begin.\n\nFirst: 👇",
+    STAGES["GET_DIAGNOSIS"]: "Q: What is the primary diagnosis? (e.g., Breast Cancer)",
+    STAGES["GET_STAGE"]: "Q: What is the stage or progression? (e.g., Stage IV, Metastatic)",
+    STAGES["GET_BIOMARKERS"]: "Q: Are there any known biomarkers? (e.g., HR-positive). List them or type 'None'.",
+    STAGES["GET_PRIOR_TREATMENT"]: "Q: What treatments have been received previously? (e.g., Chemotherapy, Immunotherapy)",
+    STAGES["GET_IMAGING"]: "Q: Any recent imaging results indicating current status? (e.g., Stable disease, Progression)",
+    STAGES["ASK_CONSENT"]: "Q: Would you like to save your query context and contact information for potential follow-up?",
     STAGES["GET_NAME"]: "Q: Please enter your First and Last Name:",
     STAGES["GET_EMAIL"]: "Q: Please enter your Email Address:",
-    STAGES["GET_PHONE"]: "Q: Please enter your Phone Number (optional, press Enter if skipping):",
-    STAGES["FINAL_SUMMARY"]: "Generating a final summary based on the gathered information...", # This prompt is immediately followed by the LLM summary
-    STAGES["END"]: "Thank you for using."
+    STAGES["GET_PHONE"]: "Q: Please enter your Phone Number (optional):",
+    STAGES["END"]: "Exploration complete. Please remember to discuss all findings and options with your healthcare provider."
+    # Internal stages removed, handled by logic/spinners
 }
 
-# Helper to get stage name for debug display
 STAGE_NAMES = {v: k for k, v in STAGES.items()}
 
-# --- Helper Functions ---
+# --- Helper Functions (Parsing, Sorting, Saving) ---
+# (parse_time_to_months, parse_improvement_percentage, sort_key_with_none, check_phases, save_user_data, get_llm_client remain unchanged from previous version)
 
-def clean_text(text, max_len=None):
-    """Basic text cleaning: remove HTML, normalize whitespace, handle None, optional truncation."""
-    if text is None: return "N/A"
-    text = str(text)
-    text = re.sub(r'<[^>]+>', '', text) # Remove HTML tags
-    text = re.sub(r'\s+', ' ', text).strip() # Normalize whitespace
-    if max_len and len(text) > max_len:
-        # Try to truncate nicely at a word boundary or sentence boundary
-        truncated = text[:max_len]
-        last_space = truncated.rfind(' ')
-        last_sentence_end = max(truncated.rfind('.'), truncated.rfind('!'), truncated.rfind('?'))
-        if last_sentence_end > last_space and last_sentence_end > max_len * 0.8: # Prioritize sentence end if close to max_len
-             truncated = truncated[:last_sentence_end + 1]
-        elif last_space > max_len * 0.7: # Otherwise truncate at word boundary if not too short
-             truncated = truncated[:last_space]
+def parse_time_to_months(time_str):
+    if isinstance(time_str, (int, float)): return float(time_str)
+    if not isinstance(time_str, str): return None
+    time_str = time_str.strip().lower()
+    if time_str in ['n/a', 'not applicable', 'not reported', 'not reached', 'nr', '', 'nan']: return None
+    match_months = re.match(r'(\d+(\.\d+)?)\s*m', time_str)
+    if match_months: return float(match_months.group(1))
+    match_years = re.match(r'(\d+(\.\d+)?)\s*y', time_str)
+    if match_years: return float(match_years.group(1)) * 12
+    try: return float(time_str)
+    except ValueError: return None
 
-        if len(truncated) < max_len * 0.5 and len(truncated) < 50: # Avoid overly aggressive truncation
-             truncated = text[:max_len] # Fallback to simple character truncation
+def parse_improvement_percentage(perc_str):
+    if isinstance(perc_str, (int, float)): return float(perc_str)
+    if not isinstance(perc_str, str): return None
+    perc_str = perc_str.strip().lower()
+    if perc_str in ['n/a', 'not applicable', 'not reported', 'not statistically significant', 'nss', '', 'nan']: return None
+    match = re.match(r'(-?\d+(\.\d+)?)\s*%', perc_str)
+    if match: return float(match.group(1))
+    try: return float(perc_str)
+    except ValueError: return None
 
-        text = truncated + "..." if truncated != text else text
+def sort_key_with_none(value, reverse=True):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return float('-inf') if reverse else float('inf')
+    try: return float(value)
+    except (ValueError, TypeError): return float('-inf') if reverse else float('inf')
 
-    return text if text else "N/A"
+def check_phases(trial_phases_raw):
+    if not isinstance(trial_phases_raw, str) or not trial_phases_raw.strip(): return False
+    trial_individual_phases = re.split(r'[|/,\s]+', trial_phases_raw.strip())
+    for phase in trial_individual_phases:
+        if phase.strip().upper() in TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES:
+            return True
+    return False
 
 def save_user_data(data):
-    """Appends user data to the text file. WARNING: Not secure for real PII."""
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(USER_DATA_FILE, "a", encoding="utf-8") as f:
             f.write(f"--- Contact Entry: {timestamp} ---\n")
             f.write(f"  Consent Given: {data.get('ConsentGiven', 'N/A')}\n")
-            if data.get('ConsentGiven'):
+            if data.get('ConsentGiven') is True:
                 f.write(f"  Name: {data.get('Name', 'N/A')}\n")
                 f.write(f"  Email: {data.get('Email', 'N/A')}\n")
                 f.write(f"  Phone: {data.get('Phone', 'N/A')}\n")
@@ -149,1068 +178,578 @@ def save_user_data(data):
         st.error("An unexpected error occurred while saving contact information.")
         return False
 
-def get_llm_client(model_id):
-    """Initializes and returns the Groq client."""
+def get_llm_client():
     try:
         return Groq(api_key=GROQ_API_KEY)
     except Exception as e:
         logging.critical(f"Failed to initialize Groq client: {e}", exc_info=True)
-        st.error("FATAL ERROR: Could not initialize AI client. Please check configuration.")
-        st.stop() # Halt app if client can't be initialized
+        st.error("FATAL ERROR: Could not initialize AI client.")
+        st.stop()
 
-# --- Stage Advancement Function ---
-def advance_stage(next_stage):
-    """Helper to update stage and add assistant prompt to messages."""
-    logging.info(f"Advancing stage from {STAGE_NAMES.get(st.session_state.stage, 'Unknown')} to {STAGE_NAMES.get(next_stage, 'Unknown')}")
-    st.session_state.stage = next_stage
-    prompt = STAGE_PROMPTS.get(next_stage)
-    # Add prompt only if it's new and not a processing/end stage trigger
-    if prompt and next_stage not in [STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"], STAGES["END"]]:
-        msg = {"role": "assistant", "content": prompt}
-        if next_stage == STAGES["ASK_CONSENT"]: msg["type"] = "buttons" # Indicate this message requires button UI
-        st.session_state.messages.append(msg)
+# --- Caching and Data/Embedding Loading Functions ---
+# (load_sentence_transformer_model, load_and_preprocess_drug_data, get_or_generate_drug_embeddings,
+#  load_and_preprocess_trial_data, get_or_generate_trial_embeddings remain unchanged from previous version)
+
+@st.cache_resource(show_spinner="Loading embedding model...")
+def load_sentence_transformer_model(model_name=EMBEDDING_MODEL_NAME):
+    try:
+        logging.info(f"Loading Sentence Transformer model: {model_name}")
+        model = SentenceTransformer(model_name)
+        logging.info(f"Model {model_name} loaded.")
+        return model
+    except Exception as e:
+        logging.error(f"Error loading Sentence Transformer model '{model_name}': {e}", exc_info=True)
+        st.error(f"Failed to load the embedding model ({model_name}).")
+        st.stop()
+
+@st.cache_data(show_spinner="Loading drug data...")
+def load_and_preprocess_drug_data(csv_path):
+    try:
+        logging.info(f"Loading drug data from {csv_path}")
+        df = pd.read_csv(csv_path)
+        logging.info(f"Drug data loaded. Shape: {df.shape}")
+        missing_cols = [col for col in DRUG_TEXT_COLUMNS_FOR_EMBEDDING if col not in df.columns]
+        if missing_cols: raise ValueError(f"Missing required columns in {csv_path}: {missing_cols}")
+        df['combined_text_for_embedding'] = df[DRUG_TEXT_COLUMNS_FOR_EMBEDDING].fillna('').astype(str).agg(' '.join, axis=1)
+        df['Treatment_OS_Months_Parsed'] = df.get('Treatment_OS', pd.Series([None]*len(df))).apply(parse_time_to_months)
+        df['Control_OS_Months_Parsed'] = df.get('Control_OS', pd.Series([None]*len(df))).apply(parse_time_to_months)
+        df['OS_Improvement_Percentage_Parsed'] = df.get('OS_Improvement (%)', pd.Series([None]*len(df))).apply(parse_improvement_percentage)
+        df['Treatment_PFS_Months_Parsed'] = df.get('Treatment_PFS', pd.Series([None]*len(df))).apply(parse_time_to_months)
+        df['Control_PFS_Months_Parsed'] = df.get('Control_PFS', pd.Series([None]*len(df))).apply(parse_time_to_months)
+        df['PFS_Improvement_Percentage_Parsed'] = df.get('PFS_Improvement (%)', pd.Series([None]*len(df))).apply(parse_improvement_percentage)
+        df['Calculated_OS_Improvement_Months'] = df.apply(lambda row: row['Treatment_OS_Months_Parsed'] - row['Control_OS_Months_Parsed'] if pd.notna(row['Treatment_OS_Months_Parsed']) and pd.notna(row['Control_OS_Months_Parsed']) else None, axis=1)
+        df['Calculated_PFS_Improvement_Months'] = df.apply(lambda row: row['Treatment_PFS_Months_Parsed'] - row['Control_PFS_Months_Parsed'] if pd.notna(row['Treatment_PFS_Months_Parsed']) and pd.notna(row['Control_PFS_Months_Parsed']) else None, axis=1)
+        logging.info("Drug data preprocessing complete.")
+        return df.fillna('N/A')
+    except FileNotFoundError: logging.error(f"Drug data file not found: {csv_path}"); st.error(f"ERROR: Drug data file ({csv_path}) not found."); st.stop()
+    except ValueError as ve: logging.error(f"ValueError processing drug data: {ve}", exc_info=True); st.error(f"ERROR: Problem processing drug data file ({csv_path}). Details: {ve}"); st.stop()
+    except Exception as e: logging.error(f"Unexpected error loading/processing drug data {csv_path}: {e}", exc_info=True); st.error(f"An unexpected error occurred loading drug data from {csv_path}."); st.stop()
+
+def get_or_generate_drug_embeddings(_drug_df, _model, embeddings_path=DRUG_EMBEDDINGS_FILE):
+    if os.path.exists(embeddings_path):
+        try:
+            logging.info(f"Loading existing drug embeddings from {embeddings_path}")
+            embeddings = np.load(embeddings_path)
+            if embeddings.shape[0] == len(_drug_df) and embeddings.shape[1] == _model.get_sentence_embedding_dimension():
+                 logging.info("Drug embeddings loaded successfully.")
+                 return embeddings
+            else: logging.warning(f"Loaded drug embeddings shape mismatch. Regenerating.")
+        except Exception as e: logging.error(f"Error loading drug embeddings: {e}. Regenerating.", exc_info=True)
+    logging.info("Generating new drug embeddings...")
+    try:
+        texts_to_embed = _drug_df['combined_text_for_embedding'].tolist()
+        if not texts_to_embed: logging.warning("No text in drug data for embedding."); return np.array([])
+        embeddings = _model.encode(texts_to_embed, show_progress_bar=True, convert_to_numpy=True)
+        logging.info("Drug embeddings generated.")
+        try: np.save(embeddings_path, embeddings); logging.info(f"Drug embeddings saved to {embeddings_path}")
+        except Exception as e: logging.error(f"Error saving drug embeddings: {e}", exc_info=True); st.warning(f"Could not save generated drug embeddings.")
+        return embeddings
+    except Exception as e: logging.error(f"Error generating drug embeddings: {e}", exc_info=True); st.error("Error generating drug embeddings."); return np.array([])
+
+@st.cache_data(show_spinner="Loading trial data...")
+def load_and_preprocess_trial_data(xlsx_path):
+    try:
+        logging.info(f"Loading trial data from {xlsx_path}")
+        df = pd.read_excel(xlsx_path)
+        logging.info(f"Trial data loaded. Shape: {df.shape}")
+        missing_cols = [col for col in TRIAL_TEXT_COLUMNS_FOR_EMBEDDING if col not in df.columns]
+        if missing_cols: raise ValueError(f"Missing required columns in {xlsx_path}: {missing_cols}")
+        df['combined_text_for_embedding'] = df[TRIAL_TEXT_COLUMNS_FOR_EMBEDDING].fillna('').astype(str).agg(' '.join, axis=1)
+        if TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN in df.columns: df[TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN] = df[TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN].fillna('').astype(str)
+        if TRIAL_FILTER_PHASES_COLUMN in df.columns: df[TRIAL_FILTER_PHASES_COLUMN] = df[TRIAL_FILTER_PHASES_COLUMN].fillna('').astype(str)
+        if TRIAL_FILTER_STUDY_TYPE_COLUMN in df.columns: df[TRIAL_FILTER_STUDY_TYPE_COLUMN] = df[TRIAL_FILTER_STUDY_TYPE_COLUMN].fillna('').astype(str)
+        logging.info("Trial data preprocessing complete.")
+        return df.fillna('N/A')
+    except FileNotFoundError: logging.error(f"Trial data file not found: {xlsx_path}"); st.error(f"ERROR: Trial data file ({xlsx_path}) not found."); st.stop()
+    except ValueError as ve: logging.error(f"ValueError processing trial data: {ve}", exc_info=True); st.error(f"ERROR: Problem processing trial data file ({xlsx_path}). Details: {ve}"); st.stop()
+    except Exception as e: logging.error(f"Unexpected error loading/processing trial data {xlsx_path}: {e}", exc_info=True); st.error(f"An unexpected error occurred loading trial data from {xlsx_path}."); st.stop()
+
+def get_or_generate_trial_embeddings(_trial_df, _model, embeddings_path=TRIAL_EMBEDDINGS_FILE, map_path=TRIAL_INDEX_MAP_FILE):
+    embeddings, index_map = None, None
+    if os.path.exists(embeddings_path) and os.path.exists(map_path):
+        try:
+            logging.info(f"Loading existing trial embeddings/map")
+            embeddings = np.load(embeddings_path)
+            with open(map_path, 'rb') as f: index_map = pickle.load(f)
+            if embeddings is not None and index_map is not None and \
+               embeddings.shape[0] == len(index_map) and \
+               embeddings.shape[1] == _model.get_sentence_embedding_dimension() and \
+               max(index_map.keys(), default=-1) < len(_trial_df):
+                 logging.info("Trial embeddings/map loaded successfully.")
+                 return embeddings, index_map
+            else: logging.warning(f"Trial embeddings/map shape mismatch or invalid data. Regenerating."); embeddings, index_map = None, None
+        except Exception as e: logging.error(f"Error loading trial embeddings/map: {e}. Regenerating.", exc_info=True); embeddings, index_map = None, None
+    logging.info("Generating new trial embeddings and index map...")
+    try:
+        non_empty_mask = _trial_df['combined_text_for_embedding'].str.strip() != ''
+        non_empty_indices = _trial_df.index[non_empty_mask].tolist()
+        texts_to_embed = _trial_df.loc[non_empty_indices, 'combined_text_for_embedding'].tolist()
+        if not texts_to_embed: logging.warning("No non-empty text in trial data for embedding."); return np.array([]), {}
+        embeddings = _model.encode(texts_to_embed, show_progress_bar=True, convert_to_numpy=True)
+        index_map = {original_idx: emb_idx for emb_idx, original_idx in enumerate(non_empty_indices)}
+        logging.info("Trial embeddings/map generated.")
+        try:
+            np.save(embeddings_path, embeddings)
+            with open(map_path, 'wb') as f: pickle.dump(index_map, f)
+            logging.info(f"Trial embeddings/map saved.")
+        except Exception as e: logging.error(f"Error saving trial embeddings/map: {e}", exc_info=True); st.warning("Could not save generated trial embeddings/map.")
+        return embeddings, index_map
+    except Exception as e: logging.error(f"Error generating trial embeddings: {e}", exc_info=True); st.error("Error generating trial embeddings."); return np.array([]), {}
+
+
+# --- Local Matching Functions ---
+# Pass session_state threshold values to these functions
+
+def find_relevant_drugs_local(df_drugs: pd.DataFrame, drug_embeddings: np.ndarray, model: SentenceTransformer,
+                              user_cancer_type_raw: str, user_stage_raw: str, user_biomarkers_raw: str,
+                              relevance_threshold: float, # Now passed as argument
+                              max_results: int = MAX_DRUGS_TO_DISPLAY):
+    logging.info("Starting local drug search...")
+    if drug_embeddings.size == 0: logging.warning("Drug embeddings empty."); return []
+    user_biomarkers_list = [b.strip() for b in user_biomarkers_raw.split(',') if b.strip()]
+    user_query_text = f"{user_cancer_type_raw} {user_stage_raw} {' '.join(user_biomarkers_list)}".strip()
+    logging.info(f"Drug query: '{user_query_text}', Threshold: {relevance_threshold:.2f}")
+    if not user_query_text: logging.warning("User drug query empty."); return []
+    try: user_embedding = model.encode(user_query_text, convert_to_numpy=True)
+    except Exception as e: logging.error(f"Error generating drug query embedding: {e}", exc_info=True); st.warning("Could not generate query embedding."); return []
+    potential_results = []
+    try: similarities = cosine_similarity([user_embedding], drug_embeddings)[0]
+    except ValueError as e: logging.error(f"Error calculating drug similarities: {e}", exc_info=True); st.error("Error comparing query to drug data."); return []
+    for index, row in df_drugs.iterrows():
+        if index >= len(similarities): logging.warning(f"Drug index {index} out of bounds for similarities."); continue
+        semantic_sim = similarities[index]
+        if semantic_sim >= relevance_threshold:
+            result_dict = {'index': index, 'semantic_similarity': semantic_sim, **row.to_dict()} # Include all columns
+            potential_results.append(result_dict)
+    potential_results.sort(key=lambda x: (
+        sort_key_with_none(x['semantic_similarity'], reverse=True),
+        sort_key_with_none(x.get('Calculated_OS_Improvement_Months'), reverse=True),
+        sort_key_with_none(x.get('OS_Improvement_Percentage_Parsed') is not None, reverse=True),
+        sort_key_with_none(x.get('OS_Improvement_Percentage_Parsed'), reverse=True),
+        sort_key_with_none(x.get('PFS_Improvement_Percentage_Parsed') is not None, reverse=True),
+        sort_key_with_none(x.get('PFS_Improvement_Percentage_Parsed'), reverse=True),
+    ), reverse=False)
+    potential_results.reverse()
+    logging.info(f"Found {len(potential_results)} relevant drugs passing threshold {relevance_threshold:.2f}.")
+    return potential_results[:max_results]
+
+def find_relevant_trials_local(df_trials: pd.DataFrame, trial_embeddings: np.ndarray, index_to_embedding_index: dict,
+                               model: SentenceTransformer,
+                               user_cancer_type_raw: str, user_stage_raw: str, user_biomarkers_raw: str,
+                               relevance_threshold: float, # Now passed as argument
+                               max_results: int = MAX_TRIALS_TO_DISPLAY):
+    logging.info("Starting local trial search...")
+    if trial_embeddings.size == 0 or not index_to_embedding_index: logging.warning("Trial embeddings/map empty."); return []
+    user_biomarkers_list = [b.strip() for b in user_biomarkers_raw.split(',') if b.strip()]
+    user_query_text = f"{user_cancer_type_raw} {user_stage_raw} {' '.join(user_biomarkers_list)}".strip()
+    logging.info(f"Trial query: '{user_query_text}', Threshold: {relevance_threshold:.2f}")
+    if not user_query_text: logging.warning("User trial query empty."); return []
+    try: user_embedding = model.encode(user_query_text, convert_to_numpy=True)
+    except Exception as e: logging.error(f"Error generating trial query embedding: {e}", exc_info=True); st.warning("Could not generate query embedding."); return []
+    potential_results = []
+    for index, row in df_trials.iterrows():
+        primary_outcome_text = row.get(TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN, 'N/A').lower()
+        if TRIAL_FILTER_PRIMARY_OUTCOME_TERM.lower() not in primary_outcome_text: continue
+        trial_phases_raw = row.get(TRIAL_FILTER_PHASES_COLUMN, 'N/A')
+        if not check_phases(trial_phases_raw): continue
+        trial_study_type = row.get(TRIAL_FILTER_STUDY_TYPE_COLUMN, 'N/A').upper()
+        if trial_study_type != TRIAL_FILTER_STUDY_TYPE_VALUE.upper(): continue
+        if index not in index_to_embedding_index: continue
+        embedding_index = index_to_embedding_index[index]
+        if embedding_index >= len(trial_embeddings): continue
+        try: semantic_sim = cosine_similarity([user_embedding], [trial_embeddings[embedding_index]])[0][0]
+        except ValueError as e: logging.error(f"Error calculating trial similarity for index {index}: {e}", exc_info=True); continue
+        except Exception as e: logging.error(f"Unexpected error calculating similarity for trial index {index}: {e}", exc_info=True); continue
+        if semantic_sim >= relevance_threshold:
+            result_dict = {
+                'index': index, 'semantic_similarity': semantic_sim,
+                'nct_id': row.get('NCT Number', 'N/A'), 'title': row.get('Study Title', 'N/A'),
+                'status': row.get('Study Status', 'N/A'), 'conditions': row.get('Conditions', 'N/A'),
+                'interventions': row.get('Interventions', 'N/A'), 'phases': trial_phases_raw,
+                'brief_summary': row.get('Brief Summary', 'N/A'),
+                'primary_outcome': row.get(TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN, 'N/A'),
+                'study_type': trial_study_type,
+                'url': f"https://clinicaltrials.gov/study/{row.get('NCT Number', '')}" if row.get('NCT Number', 'N/A') != 'N/A' else "#"
+            }
+            potential_results.append(result_dict)
+    phase_order = {'PHASE4': 5, 'PHASE3': 4, 'PHASE2|PHASE3': 3, 'PHASE2': 2, 'PHASE1|PHASE2': 1}
+    def get_phase_sort_value(phases_raw):
+        if not isinstance(phases_raw, str): return 0
+        highest_phase_val = 0
+        individual_phases = re.split(r'[|/,\s]+', phases_raw.strip().upper())
+        for phase in individual_phases: highest_phase_val = max(highest_phase_val, phase_order.get(phase, 0))
+        return highest_phase_val
+    potential_results.sort(key=lambda x: (
+        sort_key_with_none(x['semantic_similarity'], reverse=True),
+        get_phase_sort_value(x.get('phases')),
+        0 if 'recruiting' in str(x.get('status', '')).lower() else 1
+    ), reverse=True)
+    logging.info(f"Found {len(potential_results)} relevant trials passing filters/threshold {relevance_threshold:.2f}.")
+    return potential_results[:max_results]
 
 
 # --- LLM Generation Functions ---
+# (generate_llm_response, generate_drug_summary_llm, generate_trial_summary_llm,
+#  generate_result_interpretation_llm, generate_final_summary_llm remain unchanged from previous version)
 
-def refine_fda_search_strategy_with_llm(diagnosis, stage_info, markers, model_id):
-    """Uses LLM to create a prioritized, tiered search strategy for the FDA API."""
-    logging.info(f"[LLM Call - Strategy] Refining FDA search strategy for: D='{diagnosis}', S='{stage_info}', M='{markers}', Model={model_id}")
-
-    # Default strategy if LLM fails
-    default_strategy = {
-        "primary_search": [term.strip('",.') for term in f"{diagnosis} {markers}".split() if len(term) > 2],
-        "secondary_search": [term.strip('",.') for term in diagnosis.split() if len(term) > 2] or ["cancer"],
-        "tertiary_search": [], # Keep tertiary empty by default
-        "fallback_search": ["cancer"]
-    }
-    if not diagnosis: diagnosis = "cancer" # Ensure diagnosis is not empty for fallback logic
-
-    client = get_llm_client(model_id)
-
-    prompt = f"""
-    Analyze the following cancer information provided by a user:
-    Diagnosis: "{diagnosis}"
-    Stage/Progression: "{stage_info}"
-    Biomarkers: "{markers}"
-
-    Create a prioritized, tiered JSON search strategy focusing on the 'indications_and_usage' field for the FDA drug label database. The strategy should list terms relevant to the user's condition, prioritizing specific terms first.
-
-    Output ONLY the JSON object like {{"primary_search": [], "secondary_search": [], "tertiary_search": [], "fallback_search": []}}.
-
-    Rules for generating search terms:
-    1.  Identify the main cancer type and any significant subtypes.
-    2.  Include specific biomarkers if provided and relevant.
-    3.  Add "metastatic" if stage/progression indicates spread (Stage IV, metastatic, advanced).
-    4.  Normalize terms (e.g., "nsclc" -> "non-small cell lung cancer").
-    5.  Keep terms concise and relevant to drug indications.
-    6.  Prioritize terms: primary should be most specific, secondary less so, tertiary even less, and fallback very general.
-    7.  Terms within a list will be combined with AND in the search query for that tier.
-    8.  Ensure terms are relevant keywords, not full sentences.
-
-    Example 1 (NSCLC Stage IV EGFR positive):
-    {{"primary_search": ["non-small cell lung cancer", "EGFR", "metastatic"], "secondary_search": ["lung cancer", "EGFR"], "tertiary_search": ["non-small cell lung cancer", "stage IV"], "fallback_search": ["lung cancer"]}}
-
-    Example 2 (Metastatic Breast Cancer, hormone receptor positive):
-    {{"primary_search": ["metastatic breast cancer", "hormone receptor positive"], "secondary_search": ["breast cancer", "metastatic"], "tertiary_search": ["hormone receptor positive cancer"], "fallback_search": ["breast cancer"]}}
-
-    Example 3 (Melanoma, unknown stage/markers):
-    {{"primary_search": ["melanoma"], "secondary_search": ["skin cancer"], "tertiary_search": [], "fallback_search": ["cancer"]}}
-
-    Example 4 (Leukemia, Specific Type):
-    {{"primary_search": ["acute myeloid leukemia"], "secondary_search": ["leukemia"], "tertiary_search": [], "fallback_search": ["cancer"]}}
-
-    JSON Output:
-    """
-    strategy = default_strategy # Initialize with default
+def generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=300, temperature=0.2):
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are an expert medical terminology assistant designing FDA search strategies. Output ONLY the valid JSON strategy object. Ensure terms are concise and relevant to drug indications."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model_id,
-            temperature=0.1,
-            max_tokens=400, # Adjusted max tokens
-            response_format={"type": "json_object"} # Request JSON object output
-        )
-        response_content = chat_completion.choices[0].message.content
-        logging.info(f"LLM raw strategy response: {response_content}")
-        try:
-            parsed_json = json.loads(response_content)
-            required_keys = ["primary_search", "secondary_search", "tertiary_search", "fallback_search"]
-            if isinstance(parsed_json, dict) and all(key in parsed_json for key in required_keys):
-                valid_strategy = True; temp_strategy = {}
-                for key in required_keys:
-                    if isinstance(parsed_json[key], list) and all(isinstance(term, str) for term in parsed_json[key]):
-                        # Clean and remove empty terms
-                        temp_strategy[key] = [t.strip() for t in parsed_json[key] if t.strip()]
-                    else:
-                        valid_strategy = False; logging.warning(f"LLM strategy JSON invalid: key '{key}' invalid type or contents. Val: {parsed_json.get(key)}"); temp_strategy[key] = default_strategy.get(key, [])
-                strategy = temp_strategy; logging.info(f"LLM FDA search strategy {'fully' if valid_strategy else 'partially'} parsed: {strategy}")
-            else:
-                logging.warning(f"LLM strategy JSON structure invalid. Using default. Resp: {response_content}"); strategy = default_strategy
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logging.error(f"Error parsing LLM JSON strategy: {e}. Resp: {response_content}", exc_info=True)
-            strategy = default_strategy
-    except (RateLimitError, APIError) as e:
-        logging.error(f"Groq API error (strategy): {e}", exc_info=True)
-        st.warning("API error generating FDA search strategy. Using a basic strategy.")
-        strategy = default_strategy
-    except Exception as e:
-        logging.error(f"Unexpected LLM FDA strategy error: {e}", exc_info=True)
-        st.warning("Error generating FDA search strategy.")
-        strategy = default_strategy
+        chat_completion = client.chat.completions.create(messages=[{"role": "system", "content": system_prompt},{"role": "user", "content": user_prompt}], model=model_id, temperature=temperature, max_tokens=max_tokens)
+        response = chat_completion.choices[0].message.content
+        response = response.strip().replace("```json", "").replace("```", "").strip()
+        unwanted_phrases = ["Here is the summary:", "Summary:", "Here's the interpretation:", "Interpretation:", "Okay, here's the explanation:", "Explanation:"]
+        for phrase in unwanted_phrases:
+             if response.lower().startswith(phrase.lower()): response = response[len(phrase):].strip()
+        return response
+    except RateLimitError as e: logging.error(f"Groq Rate Limit Error: {e}", exc_info=True); st.warning("AI assistant unavailable (rate limit)."); return "Error: AI assistant rate limit."
+    except APIError as e: logging.error(f"Groq API Error: {e}", exc_info=True); st.warning(f"AI assistant API error ({e.status_code})."); return f"Error: AI assistant API error ({e.status_code})."
+    except Exception as e: logging.error(f"Unexpected LLM error: {e}", exc_info=True); st.warning("Unexpected error contacting AI assistant."); return "Error: Unexpected AI issue."
 
-    # Final check to ensure all keys are present and are lists of strings
-    for key in ["primary_search", "secondary_search", "tertiary_search", "fallback_search"]:
-        if key not in strategy or not isinstance(strategy[key], list):
-            strategy[key] = default_strategy.get(key, [])
-        strategy[key] = [term for term in strategy[key] if isinstance(term, str) and term.strip()] # Ensure elements are non-empty strings
+def generate_drug_summary_llm(user_inputs, drug_results, model_id):
+    logging.info(f"[LLM Call - Drug Summary] For {len(drug_results)} drugs.")
+    client = get_llm_client()
+    if not drug_results: return f"No matching drug studies found for: Diagnosis '{user_inputs.get('diagnosis', 'N/A')}', Stage '{user_inputs.get('stage', 'N/A')}', Biomarkers '{user_inputs.get('biomarkers', 'N/A')}'."
+    drug_list_str = "\n".join([f"- {d.get('Drug Name', 'N/A')} (Sim: {d.get('semantic_similarity', 0):.2f})" for d in drug_results[:5]])
+    if len(drug_results) > 5: drug_list_str += f"\n- ...and {len(drug_results) - 5} more."
+    system_prompt = "Summarize drug study findings concisely based on relevance. Do NOT give medical advice. Mention number found and basis (similarity, outcome)."
+    user_prompt = f"""User Input: Dx="{user_inputs.get('diagnosis', 'N/A')}", Stg="{user_inputs.get('stage', 'N/A')}", Bio="{user_inputs.get('biomarkers', 'N/A')}" Found {len(drug_results)} relevant studies. Top: {drug_list_str} Provide a brief (2-3 sentences) summary. State number found/basis. Mention ranking (relevance, OS/PFS). Advise review/consult doctor."""
+    summary = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=250)
+    logging.info(f"LLM drug summary: {summary}")
+    return summary
 
-    logging.info(f"Final refined FDA strategy: {strategy}")
-    return strategy
+def generate_trial_summary_llm(user_inputs, trial_results, model_id):
+    logging.info(f"[LLM Call - Trial Summary] For {len(trial_results)} trials.")
+    client = get_llm_client()
+    if not trial_results: return f"No matching trials found after filters (Outcome: OS, Phase 2+, Interventional) and relevance for: Dx '{user_inputs.get('diagnosis', 'N/A')}', Stg '{user_inputs.get('stage', 'N/A')}', Bio '{user_inputs.get('biomarkers', 'N/A')}'."
+    recruiting_count = sum(1 for t in trial_results if 'recruiting' in t.get('status', '').lower())
+    trial_list_str = "\n".join([f"- {t.get('nct_id', 'N/A')}: {t.get('title', 'N/A')} (Sts: {t.get('status', 'N/A')}, Ph: {t.get('phases', 'N/A')}, Sim: {t.get('semantic_similarity', 0):.2f})" for t in trial_results[:5]])
+    if len(trial_results) > 5: trial_list_str += f"\n- ...and {len(trial_results) - 5} more."
+    system_prompt = "Summarize trial findings concisely based on filters/relevance. Do NOT give medical advice. Mention number found, recruiting count, basis (filters + relevance)."
+    user_prompt = f"""User Input: Dx="{user_inputs.get('diagnosis', 'N/A')}", Stg="{user_inputs.get('stage', 'N/A')}", Bio="{user_inputs.get('biomarkers', 'N/A')}" Found {len(trial_results)} relevant trials after filters (Outcome: '{TRIAL_FILTER_PRIMARY_OUTCOME_TERM}', Phase: {TRIAL_ACCEPTABLE_PHASES}, Type: '{TRIAL_FILTER_STUDY_TYPE_VALUE}') & sim. threshold. {recruiting_count} recruiting. Top: {trial_list_str} Provide brief (2-3 sentences) summary. State number found/basis. Mention recruiting count. Advise review/consult doctor."""
+    summary = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=300)
+    logging.info(f"LLM trial summary: {summary}")
+    return summary
 
-
-def generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, model_id):
-    """Uses LLM to generate a clean JSON array of keywords and phrases for ClinicalTrials.gov query.term."""
-    
-    client = get_llm_client(model_id)
-    prompt = f"""
-    Take the following patient information and build clinicaltrials api query.titles search parameter 
-    return very important keywords connected by term 'OR' 
-    User Information:
-    Diagnosis: "{diagnosis}"
-    Stage/Progression: "{stage_info}"
-    Biomarkers: "{biomarkers}"
-
-    here is information for you 
-    
-    1. The primary cancer type (e.g., "lung cancer", "breast cancer"). Quote multi-word types.
-    2. Relevant specific subtypes (e.g., "non-small cell", "adenocarcinoma"). 
-    3. Significant biomarkers as quoted phrases or single terms (e.g., "EGFR mutation", "HER2 positive", "PD-L1").
-    4. "metastatic" or related terms if the stage indicates spread.
-
-    Exclude from the array:
-    - Full sentences or questions.
-    - Any introductory or explanatory text (like "Here is the list...", "Note that...", etc.).
-    - Any conversational elements.
-
-    Output ONLY the SEARCH PARAMETER VALUE
-    AVOID STARTING OR ENDING SENTENCES 
-    DONT COMMENT ON YOUR RESPONSE
-    DONT EXPLAIN YOUR ANSWER 
-    
-    !IMPORTANT ONLY RESPOND THE SEARCH VALUES
-
-    Example output: "Breast Cancer OR STAGE III"
-    
-    Output:
-    """
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are clinicalstrials api search parameter writer."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model_id, temperature=0.3, max_tokens=300,
-            
-        )
-        response_content = chat_completion.choices[0].message.content
-        # logging.info(f"LLM raw CT.gov keywords response: {response_content}")
-
-        return response_content
-    except Exception as e:
-        print("Exception2: ", e)
-
-def generate_drug_summary_llm(diagnosis, markers, fda_drugs, model_id):
-    """Generates a concise drug summary from the list of found drugs using LLM."""
-    logging.info(f"[LLM Call - Drug Summary] Generating drug summary for {len(fda_drugs)} drugs.")
-    if not fda_drugs:
-        return f"Based on searches of FDA drug labels related to '{diagnosis}' and markers like '{markers}', no specific drug matches were found based on the search strategy used."
-
-    # Limit drugs sent to LLM prompt to manage token count
-    drug_list_str = "\n".join([
-        f"- {d.get('brand_name', 'N/A')} ({d.get('generic_name', 'N/A')}): Snippet: '{clean_text(d.get('indication_snippet', 'N/A'), 150)}'"
-        for d in fda_drugs[:10]
-    ])
-    if len(fda_drugs) > 10:
-        drug_list_str += f"\n- ...and {len(fda_drugs) - 10} more."
-
-
-    client = get_llm_client(model_id)
-    prompt = f"""
-    The user is exploring potential treatments based on their cancer information.
-    Diagnosis: "{diagnosis}"
-    Biomarkers: "{markers}"
-    A search found {len(fda_drugs)} FDA-approved drugs with labels containing relevant indications. Here are some of them:
-    {drug_list_str}
-
-    Summarize these findings concisely for the user.
-    Start with a sentence stating the search identified potential drugs based on their diagnosis and relevant markers.
-    Mention the *number* of drugs found.
-    List the brand names (if available) and generic names of the *first few* drugs found (e.g., "including Drug A (Generic B), Drug C (Generic D), etc.").
-    Do NOT include any links or external URLs in the summary.
-    Keep it to 2-4 sentences.
-
-    Summary:
-    """
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are an AI assistant summarizing drug information. Provide a concise summary of the listed drugs based on the user's context. Do not include links. Include the total count."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model_id, temperature=0.2, max_tokens=250
-        )
-        summary = clean_text(chat_completion.choices[0].message.content)
-        # Ensure count is mentioned if LLM missed it
-        if str(len(fda_drugs)) not in summary:
-             summary = f"Found {len(fda_drugs)} potentially relevant drug(s). " + summary
-
-        logging.info(f"LLM drug summary generated: {summary}")
-        return summary
-    except (RateLimitError, APIError) as e:
-        logging.error(f"Groq API error (drug summary): {e}", exc_info=True)
-        return f"An error occurred while generating the drug summary. Found {len(fda_drugs)} potential drug(s)."
-    except Exception as e:
-        logging.error(f"Unexpected LLM drug summary error: {e}", exc_info=True)
-        return f"An error occurred while generating the drug summary. Found {len(fda_drugs)} potential drug(s)."
-
-
-def generate_trial_summary_llm(diagnosis, markers, stage_info, clinical_trials, model_id):
-    """Generates a concise clinical trial summary, including count and status, using LLM."""
-    logging.info(f"[LLM Call - Trial Summary] Generating trial summary for {len(clinical_trials)} trials.")
-
-    num_found = len(clinical_trials)
-    if num_found == 0:
-        return f"Based on keyword searches for '{diagnosis}', stage '{stage_info}', and markers '{markers}', no matching clinical trials were found in the public database."
-
-    # Identify active/recruiting trials for mention in summary from the results
-    active_statuses = ['recruiting', 'not yet recruiting', 'enrolling by invitation']
-    num_active = len([t for t in clinical_trials if t.get('status', '').lower() in active_statuses])
-
-
-    # Limit trials sent to LLM prompt to manage token count
-    trial_titles_status_str = "\n".join([
-        f"- '{clean_text(t.get('title', 'N/A'), 100)}' (Status: {t.get('status', 'N/A')})"
-        for t in clinical_trials[:min(num_found, 5)]
-    ])
-    if num_found > 5:
-        trial_titles_status_str += f"\n- ...and {num_found - 5} more."
-
-
-    client = get_llm_client(model_id)
-    prompt = f"""
-    The user is exploring potential clinical trials based on their cancer information.
-    Diagnosis: "{diagnosis}"
-    Stage/Progression: "{stage_info}"
-    Biomarkers: "{markers}"
-    A keyword search on ClinicalTrials.gov found {num_found} studies. Approximately {num_active} of these are listed with 'Recruiting' or similar active statuses. Here are a few examples from the results:
-    {trial_titles_status_str}
-
-    Summarize these findings concisely for the user.
-    Start by stating the total number of trials found based on keywords related to their diagnosis and context.
-    Mention the approximate number of trials from the results that are currently 'Recruiting' or in similar active statuses.
-    Clarify that the search was based on keywords across trial fields, not strict filters.
-    Suggest reviewing the detailed list below for more information.
-    Do NOT include any links or external URLs in the summary.
-    Keep it to 2-4 sentences.
-
-    Summary:
-    """
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are an AI assistant summarizing clinical trial information found via keyword search. Provide a concise summary of the listed trials based on the user's context. Include counts and mention recruitment status from the results. Clarify the search method. Do not include links."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model_id, temperature=0.2, max_tokens=300
-        )
-        summary = clean_text(chat_completion.choices[0].message.content)
-        # Ensure counts are mentioned if LLM missed them
-        if str(num_found) not in summary or str(num_active) not in summary:
-             summary = f"Found {num_found} potential clinical trial(s) with approximately {num_active} currently active/recruiting. " + summary
-
-        logging.info(f"LLM trial summary generated: {summary}")
-        return summary
-    except (RateLimitError, APIError) as e:
-        logging.error(f"Groq API error (trial summary): {e}", exc_info=True)
-        return f"An error occurred while generating the clinical trial summary. Found {num_found} potential trial(s) with approximately {num_active} active/recruiting."
-    except Exception as e:
-        logging.error(f"Unexpected LLM trial summary error: {e}", exc_info=True)
-        return f"An error occurred while generating the clinical trial summary. Found {num_found} potential trial(s) with approximately {num_active} active/recruiting."
-
+def generate_result_interpretation_llm(result_type, result_data, user_context, model_id):
+    logging.info(f"[LLM Call - Interpretation] For {result_type}: {result_data.get('Drug Name') or result_data.get('nct_id')}")
+    client = get_llm_client()
+    system_prompt = f"Explain clinical study findings ({result_type}). Interpret OS, PFS, phase, status objectively. CRITICAL: NO MEDICAL ADVICE. State info needs discussion with doctor. Focus ONLY on data provided for this result. Concise (3-5 sentences). Explain OS (Overall Survival), PFS (Progression-Free Survival)."
+    user_prompt = f"User Context: Dx: {user_context.get('diagnosis', 'N/A')}, Stg: {user_context.get('stage', 'N/A')}, Bio: {user_context.get('biomarkers', 'N/A')}\n\n"
+    if result_type == "drug":
+        user_prompt += f"Drug Study:\nDrug: {result_data.get('Drug Name', 'N/A')} | Relevance: {result_data.get('semantic_similarity', 0):.3f}\nSummary: {textwrap.shorten(result_data.get('Brief Study Summary', 'N/A'), width=200)}\n"
+        user_prompt += f"OS: Tx=`{result_data.get('Treatment_OS', 'N/A')}`, Ctrl=`{result_data.get('Control_OS', 'N/A')}`, Imprv=`{result_data.get('OS_Improvement (%)', 'N/A')}` (Calc Months: {result_data.get('Calculated_OS_Improvement_Months', 'N/A')})\n"
+        user_prompt += f"PFS: Tx=`{result_data.get('Treatment_PFS', 'N/A')}`, Ctrl=`{result_data.get('Control_PFS', 'N/A')}`, Imprv=`{result_data.get('PFS_Improvement (%)', 'N/A')}`\n\n"
+        user_prompt += f"Explain these results for {result_data.get('Drug Name', 'N/A')}. Define OS/PFS. Indicate suggested improvement vs control (avoid certainty). Mention relevance score source. Advise doctor discussion."
+    elif result_type == "trial":
+        user_prompt += f"Trial:\nNCT: {result_data.get('nct_id', 'N/A')} | Relevance: {result_data.get('semantic_similarity', 0):.3f}\nTitle: {result_data.get('title', 'N/A')}\n"
+        user_prompt += f"Status: `{result_data.get('status', 'N/A')}` | Phase: `{result_data.get('phases', 'N/A')}`\nCond: {result_data.get('conditions', 'N/A')} | Interv: {result_data.get('interventions', 'N/A')}\n"
+        user_prompt += f"Prim Outcome Focus ('{TRIAL_FILTER_PRIMARY_OUTCOME_TERM}'): Yes\nSummary: {textwrap.shorten(result_data.get('brief_summary', 'N/A'), width=200)}\n\n"
+        user_prompt += f"Explain trial {result_data.get('nct_id', 'N/A')}. Explain Status (e.g., Recruiting) & Phase (e.g., Phase 3). Mention relevance score source. State trial goal. Advise doctor discussion on eligibility."
+    else: return "Error: Invalid result type."
+    interpretation = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=400, temperature=0.3)
+    logging.info(f"LLM interpretation: {interpretation}")
+    return interpretation
 
 def generate_final_summary_llm(user_inputs, drug_results, trial_results, model_id):
-    """Generates a final comprehensive summary using LLM, combining user context, drugs, and trials."""
-    logging.info(f"[LLM Call - Final Summary] Generating final summary.")
-
-    diagnosis = user_inputs.get("diagnosis", "a cancer condition")
-    stage_info = user_inputs.get("stage", "stage information unknown")
-    biomarkers = user_inputs.get("biomarkers", "unknown biomarkers")
-    prior_treatment = user_inputs.get("prior_treatment", "unknown prior treatments")
-    imaging = user_inputs.get("imaging", "unknown imaging results")
-
-    drug_count = len(drug_results)
-    trial_count = len(trial_results)
-
-    drug_list_summary = "No specific drugs were identified in the FDA label search."
-    if drug_count > 0:
-        drug_names = [d.get('brand_name', 'N/A') for d in drug_results[:5]] # Limit names sent to LLM
-        drug_list_summary = f"The search of FDA drug labels identified {drug_count} potentially relevant drug(s), including: {', '.join(drug_names)}."
-        if drug_count > 5: drug_list_summary += " and others."
-
-    trial_list_summary = "No clinical trials were found in the ClinicalTrials.gov search."
-    if trial_count > 0:
-        active_statuses = ['recruiting', 'not yet recruiting', 'enrolling by invitation']
-        num_active = len([t for t in trial_results if t.get('status', '').lower() in active_statuses])
-        trial_list_summary = f"The search on ClinicalTrials.gov found {trial_count} potential studies using keyword criteria. Approximately {num_active} of these were listed with 'Recruiting' or similar active statuses in the results."
-
-    client = get_llm_client(model_id)
-    prompt = f"""
-    Based on the user's provided information (Diagnosis: {diagnosis}, Stage/Progression: {stage_info}, Biomarkers: {biomarkers}):
-    - Drugs identified from FDA labels: {drug_list_summary}
-    - Clinical trials found from ClinicalTrials.gov (keyword search): {trial_list_summary}
-
-    Synthesize this information into a brief, concluding summary for the user.
-    1. Acknowledge the exploration based on their input regarding diagnosis, stage, and biomarkers.
-    2. Briefly mention the drug findings count and the clinical trial findings count/active count.
-    3. Reiterate strongly that this information is for exploration only and is NOT medical advice.
-    4. Emphasize the critical need to discuss these findings and their individual situation with their qualified oncologist or healthcare provider for personalized guidance and decision-making.
-    5. Keep it concise, 3-5 sentences. Do not include links.
-
-    Final Summary:
-    """
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are an AI assistant providing a final summary of gathered information. Synthesize the provided data concisely and professionally. Do not provide any comment or descliamer as I handle it manually."},
-                {"role": "user", "content": prompt}
-            ],
-            model=model_id, temperature=0.3, max_tokens=400
-        )
-        summary = clean_text(chat_completion.choices[0].message.content)
-        logging.info(f"LLM final summary generated: {summary}")
-        return summary
-    except (RateLimitError, APIError) as e:
-        logging.error(f"Groq API error (final summary): {e}", exc_info=True)
-        return "An error occurred while generating the final summary. Please review the drug and trial results above and discuss them with your oncologist. This information is not medical advice."
-    except Exception as e:
-        logging.error(f"Unexpected LLM final summary error: {e}", exc_info=True)
-        return "An error occurred while generating the final summary. Please review the drug and trial results above and discuss them with your oncologist. This information is not medical advice."
-
-
-# --- API Functions ---
-
-def search_fda_drugs_for_condition_and_markers(search_strategy, limit=FDA_RESULT_LIMIT, min_results_per_tier=FDA_MIN_RESULTS_FOR_NEXT_TIER):
-    """Searches FDA drug labels via openFDA API using a tiered search strategy."""
-    logging.info(f"[API Call - FDA Tiered] Executing FDA search strategy: {search_strategy}")
-    final_results = []
-    search_tier_used = "None"
-    seen_generic_names = set() # Use generic name for deduplication
-    search_tiers = ["primary_search", "secondary_search", "tertiary_search", "fallback_search"]
-
-    for tier_key in search_tiers:
-        search_terms = search_strategy.get(tier_key, [])
-        if not search_terms:
-            logging.info(f"Skipping FDA tier '{tier_key}': no terms provided by strategy.")
-            continue
-
-        logging.info(f"Attempting FDA search with tier '{tier_key}': {search_terms}")
-        query_parts = []
-        for term in search_terms:
-            term_cleaned = term.strip()
-            if not term_cleaned: continue
-            # API quirk: AND is default, phrase searching uses quotes
-            if ' ' in term_cleaned: query_parts.append(f'"{term_cleaned}"') # Quote phrases
-            else: query_parts.append(term_cleaned)
-        if not query_parts:
-            logging.warning(f"No valid query parts generated for FDA tier '{tier_key}'. Skipping tier.")
-            continue
-
-        # Search within 'indications_and_usage' field using 'AND' between terms
-        search_query = f'indications_and_usage:({" AND ".join(query_parts)})'
-        logging.info(f"Constructed FDA API query for tier '{tier_key}': {search_query}")
-
-        params = {'search': search_query, 'limit': limit}
-        current_tier_new_results = []
-
-        try:
-            response = requests.get(FDA_API_BASE_URL, params=params, timeout=20)
-            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-            data = response.json()
-
-            for item in data.get('results', []):
-                openfda_data = item.get('openfda', {})
-                # Handle potential list format for names and get first element
-                brand_name = (openfda_data.get('brand_name') or ['N/A'])[0]
-                generic_name = (openfda_data.get('generic_name') or ['N/A'])[0]
-                # indications_and_usage is also often a list
-                indication_list = item.get('indications_and_usage', ['N/A'])
-                indication = indication_list[0] if indication_list else 'N/A'
-                indication_snippet = clean_text(indication, max_len=400) # Longer snippet for detail
-
-                # Construct a Google search URL as direct label URLs are unreliable and change frequently
-                # Search for "brand_name generic_name FDA prescribing information"
-                google_search_query = f"{clean_text(brand_name)} {clean_text(generic_name)} FDA prescribing information"
-                label_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(google_search_query)}"
-
-                generic_name_cleaned = clean_text(generic_name)
-                # Deduplicate results based on generic name to avoid showing same drug multiple times
-                if generic_name_cleaned != "N/A" and generic_name_cleaned not in seen_generic_names:
-                     current_tier_new_results.append({
-                        "brand_name": clean_text(brand_name),
-                        "generic_name": generic_name_cleaned,
-                        "indication_snippet": indication_snippet,
-                        "url": label_url # This URL goes in the expander, not main text
-                     })
-                     seen_generic_names.add(generic_name_cleaned)
-                     if len(final_results) + len(current_tier_new_results) >= limit:
-                         logging.info(f"Reached total limit ({limit}) with tier '{tier_key}'. Stopping.")
-                         break # Stop adding results if we hit the overall limit
-
-            final_results.extend(current_tier_new_results)
-            logging.info(f"FDA Tier '{tier_key}' search returned {len(current_tier_new_results)} new, unique results. Total unique results: {len(final_results)}")
-
-            # Check if we have enough results OR if we already tried the last tier
-            if len(final_results) >= min_results_per_tier or tier_key == search_tiers[-1]:
-                search_tier_used = tier_key
-                logging.info(f"Met minimum FDA results ({min_results_per_tier} in total) or finished tiers with tier '{tier_key}'. Total unique: {len(final_results)}. Stopping tiered search.")
-                break # Stop trying lower priority tiers
-
-        except requests.exceptions.Timeout:
-            logging.error(f"FDA API timeout tier '{tier_key}'.")
-            st.warning(f"Drug search timed out (tier '{tier_key}'). Results may be incomplete.")
-        except requests.exceptions.HTTPError as e:
-            logging.error(f"FDA API HTTP error tier '{tier_key}': {e.response.status_code} - {e.response.text}")
-            if e.response.status_code == 404: logging.info(f"FDA Tier '{tier_key}' returned no results (404).")
-            elif e.response.status_code == 429: st.warning(f"Drug search rate limit hit (tier '{tier_key}'). Please wait a moment before retrying.")
-            else: st.warning(f"Drug search failed (tier '{tier_key}', HTTP Error {e.response.status_code}).")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"FDA API request failed tier '{tier_key}': {e}", exc_info=True)
-            st.warning("Drug search network issue.")
-        except json.JSONDecodeError as e:
-            logging.error(f"FDA API JSON decode error tier '{tier_key}': {e}", exc_info=True)
-            st.warning("Invalid response received from drug database.")
-        except Exception as e:
-            logging.error(f"Unexpected FDA processing error tier '{tier_key}': {e}", exc_info=True)
-            st.warning("Unexpected error processing drug information.")
-
-    logging.info(f"FDA Tiered Search finished. Used up to tier '{search_tier_used}'. Final unique results: {len(final_results)}")
-    return final_results[:limit] # Return up to the total limit
-
-
-def search_clinical_trials_with_keywords(diagnosis, stage_info, biomarkers, prior_treatment, model_id, limit=CT_REQUEST_LIMIT):
-    """
-    Generates keywords using LLM and searches ClinicalTrials.gov V2 API using only query.term
-    with pagination.
-    """
-    logging.info(f"[API Call - CT.gov Keyword w/ Pagination] Searching ClinicalTrials.gov for: D='{diagnosis}', S='{stage_info}', M='{biomarkers}'")
-    all_results = []
-    next_page_token = None
-    current_page = 0
-    max_pages = 5 # Safety break to avoid infinite loops, adjust if needed
-
-    # --- Use LLM to generate keywords for query.term ---
-    # keyword_list = generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, prior_treatment, model_id)
-
-    # if not keyword_list:
-    #     logging.warning("LLM failed to generate keywords or keywords list is empty. Cannot perform CT.gov search.")
-    #     st.warning("Could not generate search terms for ClinicalTrials.gov based on your input.")
-    #     return all_results # Return empty if no keywords generated
-
-    # # Join keywords with spaces for query.term - API handles implicit ANDing of simple terms
-    # # LLM is prompted to handle quoting for multi-word phrases
-    # query_term_str = " ".join(keyword_list)
-    
-    query_term_str = generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers, model_id)
-
-    logging.info(f"Constructed ClinicalTrials.gov query.term: '{query_term_str}' (from LLM keywords)")
-
-    # Fields to request from the API - Use documented V2 fields
-    fields_to_request = [
-        "NCTId", # IdentificationModule
-        "BriefTitle", # Study
-        "OverallStatus", # StatusModule
-        "Phase", # DesignModule
-        "Condition", # ConditionsModule
-        "BriefSummary", # DescriptionModule
-        "StudyType", # DesignModule
-        "InterventionList", # InterventionModule (for names)
-        "EligibilityCriteria", # EligibilityModule (for snippet)
-        "LocationList", # ContactsLocationsModule (for snippet)
-    ]
-
-    # --- Pagination Loop ---
-    while len(all_results) < limit and current_page < max_pages:
-        params = {
-            'query.term': query_term_str, # Keywords from LLM
-            'pageSize': 10, # Request up to remaining limit, max 100 per page
-            'format': 'json',
-            # 'fields': ",".join(fields_to_request)
-        }
-        if next_page_token:
-            params['pageToken'] = next_page_token
-
-        logging.info(f"CT.gov Requesting Page {current_page + 1} with params: {params}")
-
-        try:
-            response = requests.get(CTGOV_API_V2_BASE_URL, params=params, timeout=30)
-
-            # Handle specific non-200 codes more robustly
-            if response.status_code == 400:
-                logging.error(f"CT.gov API Error (400 Bad Request) for Query: term='{query_term_str}'")
-                try: error_data = response.json(); logging.error(f"API Error Details: {error_data.get('message', error_data)}")
-                except json.JSONDecodeError: logging.error("Could not decode error response body for 400 error.")
-                st.warning("Clinical trial search failed (Bad Request). Please try again or simplify your input.")
-                break # Exit loop on error
-            elif response.status_code == 404:
-                logging.info(f"No trials found on page {current_page + 1} (404) for Query: term='{query_term_str}'")
-                break # No more pages/results
-            elif response.status_code == 500:
-                 logging.error(f"CT.gov API Error (500 Internal Server Error) for Query: term='{query_term_str}'")
-                 try: error_data = response.json(); logging.error(f"API Error Details: {error_data.get('message', error_data)}")
-                 except json.JSONDecodeError: logging.error("Could not decode error response body for 500 error.")
-                 st.warning("Clinical trial search failed (Internal Server Error). Results may be incomplete.")
-                 break # Exit loop on error
-
-            response.raise_for_status() # Raise for other errors (>=400) not specifically handled
-
-            data = response.json()
-            studies_on_page = data.get('studies', [])
-            total_count = data.get('totalCount', 0) # Get total count from response
-
-            logging.info(f"CT.gov API returned {len(studies_on_page)} studies on page {current_page + 1}. Total count reported: {total_count}.")
-
-            if not studies_on_page:
-                 logging.info(f"No studies returned on page {current_page + 1}. Ending pagination.")
-                 break # No studies on this page, stop
-
-            processed_studies_on_page = []
-            for study in studies_on_page:
-                try:
-                    protocol = study.get('protocolSection', {})
-
-                    # Safely extract required fields
-                    ident_module = protocol.get('identificationModule', {})
-                    nct_id = ident_module.get('nctId', 'N/A')
-                    title = clean_text(study.get('briefTitle', 'N/A')) # BriefTitle is directly under study
-
-                    status_module = protocol.get('statusModule', {})
-                    status = clean_text(status_module.get('overallStatus', 'N/A'))
-
-                    design_module = protocol.get('designModule', {})
-                    phases_list = design_module.get('phases', ['N/A'])
-                    phases = ', '.join(phases_list)
-                    study_type = clean_text(design_module.get('studyType', 'N/A'))
-
-                    cond_module = protocol.get('conditionsModule', {})
-                    conditions = clean_text(', '.join(cond_module.get('conditionList', {}).get('condition', ['N/A'])))
-
-                    desc_module = protocol.get('descriptionModule', {})
-                    brief_summary = clean_text(desc_module.get('briefSummary', 'N/A'), max_len=500) # Longer snippet for summary
-
-                    int_module = protocol.get('interventionModule', {})
-                    interventions_list = int_module.get('interventionList', [])
-                    intervention_names = [item.get('interventionName', 'N/A') for item in interventions_list]
-                    interventions_str = clean_text(', '.join(intervention_names), max_len=300)
-
-                    elig_module = protocol.get('eligibilityModule', {})
-                    eligibility_criteria = clean_text(elig_module.get('eligibilityCriteria', 'N/A'), max_len=400) # Snippet
-
-                    loc_module = protocol.get('contactsLocationsModule', {})
-                    locations_list = loc_module.get('locationList', [])
-                    location_summaries = []
-                    for loc in locations_list:
-                        facility = loc.get('location', {}).get('facility', 'N/A')
-                        city = loc.get('location', {}).get('city', 'N/A')
-                        state = loc.get('location', {}).get('state', 'N/A')
-                        country = loc.get('location', {}).get('country', 'N/A')
-                        location_summaries.append(f"{facility}, {city}, {state}, {country}")
-                    locations_snippet = clean_text("; ".join(location_summaries), max_len=300)
-
-                    url = f"https://clinicaltrials.gov/study/{nct_id}" if nct_id != 'N/A' else "#"
-
-                    processed_studies_on_page.append({
-                         "nct_id": nct_id,
-                         "title": title,
-                         "status": status,
-                         "phase": phases,
-                         "study_type": study_type,
-                         "conditions": conditions,
-                         "summary": brief_summary,
-                         "interventions": interventions_str,
-                         "eligibility_snippet": eligibility_criteria,
-                         "contact_info": "See Study Link", # Contact details are complex in V2, direct link is best
-                         "locations_snippet": locations_snippet,
-                         "url": url
-                    })
-                except Exception as e:
-                     logging.error(f"Error processing study {study.get('briefTitle', 'N/A')}: {e}", exc_info=True)
-                     # Continue processing other studies even if one fails
-
-            all_results.extend(processed_studies_on_page)
-            logging.info(f"Added {len(processed_studies_on_page)} studies from page {current_page + 1}. Total collected: {len(all_results)}.")
-
-            next_page_token = data.get('nextPageToken')
-            if not next_page_token or len(all_results) >= limit:
-                logging.info("No next page token or limit reached. Ending pagination.")
-                break # No more pages or collected enough results
-
-            current_page += 1 # Increment page counter
-
-        except requests.exceptions.Timeout:
-            logging.error("CT.gov API request timed out.")
-            st.warning("Clinical trial search timed out. Results may be incomplete.")
-            break # Exit loop on timeout
-        except requests.exceptions.RequestException as e:
-            logging.error(f"CT.gov API request failed: {e}", exc_info=True)
-            st.warning("Could not retrieve trials due to network issue. Results may be incomplete.")
-            break # Exit loop on other request errors
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to decode CT.gov API JSON: {e}", exc_info=True)
-            st.warning("Invalid response received from trial database. Results may be incomplete.")
-            break # Exit loop on JSON error
-        except Exception as e:
-            logging.error(f"An unexpected error occurred during CT.gov search: {e}", exc_info=True)
-            st.warning("An unexpected error occurred during clinical trial search. Results may be incomplete.")
-            break # Exit loop on unexpected errors
-
-    logging.info(f"ClinicalTrials.gov Search finished. Found {len(all_results)} results using keyword query: '{query_term_str}'")
-    return all_results[:limit] # Return results up to the specified limit
-
+    logging.info(f"[LLM Call - Final Summary]")
+    client = get_llm_client()
+    drug_count = len(drug_results); trial_count = len(trial_results)
+    recruiting_trial_count = sum(1 for t in trial_results if 'recruiting' in t.get('status', '').lower())
+    drug_summary_part = f"{drug_count} drug studies identified." if drug_count > 0 else "No matching drug studies found."
+    trial_summary_part = f"{trial_count} trials identified ({recruiting_trial_count} recruiting)." if trial_count > 0 else "No matching trials found."
+    system_prompt = "Provide final summary of findings. Be professional, concise. Strongly emphasize need for medical consultation."
+    user_prompt = f"""User Context: Dx: {user_inputs.get("diagnosis", "N/A")}, Stg: {user_inputs.get("stage", "N/A")}, Bio: {user_inputs.get("biomarkers", "N/A")} Findings Summary: Drugs: {drug_summary_part} Trials: {trial_summary_part} Synthesize into brief (3-4 sentences) conclusion. 1. Acknowledge exploration. 2. State counts found. 3. Reiterate this is NOT medical advice. 4. Emphasize CRITICAL need to discuss ALL options with qualified provider."""
+    summary = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=350, temperature=0.3)
+    logging.info(f"LLM final summary: {summary}")
+    # Add final mandatory reminder
+    reminder = "\n\n**Reminder:** Discuss these informational findings thoroughly with your healthcare provider before making any decisions."
+    return summary + reminder
 
 # --- Streamlit App ---
 
-st.set_page_config( page_title="AI Treatment Match", layout="wide", initial_sidebar_state="expanded" )
+st.set_page_config(page_title="AI Drug & Trial Match", layout="wide", initial_sidebar_state="expanded")
+
+# --- Load Data and Model (Initialization) ---
+data_loaded_successfully = False
+try:
+    with st.spinner("Initializing resources... This may take a moment on first run."):
+        embedding_model = load_sentence_transformer_model()
+        df_drugs_processed = load_and_preprocess_drug_data(DRUG_DATA_CSV)
+        drug_embeddings_array = get_or_generate_drug_embeddings(df_drugs_processed, embedding_model)
+        df_trials_processed = load_and_preprocess_trial_data(TRIAL_DATA_XLSX)
+        trial_embeddings_array, trial_index_map = get_or_generate_trial_embeddings(df_trials_processed, embedding_model)
+
+    if drug_embeddings_array.size > 0 and trial_embeddings_array.size > 0 and trial_index_map is not None:
+        data_loaded_successfully = True
+        logging.info("All resources initialized successfully.")
+    else:
+        logging.error("Failed to initialize embeddings or index map.")
+        st.error("Failed to initialize necessary data embeddings. Cannot proceed.")
+except Exception as e:
+    logging.critical("App initialization failed.", exc_info=True)
 
 # --- Initialize Session State ---
 def initialize_session():
-    # Check if core session state exists, initialize fully if not
-    if 'stage' not in st.session_state or 'messages' not in st.session_state or 'user_inputs' not in st.session_state:
-        logging.info("Initializing/resetting full session state.")
+    if 'stage' not in st.session_state:
+        logging.info("Initializing new session state.")
         st.session_state.stage = STAGES["INIT"]
         st.session_state.user_inputs = {}
-        st.session_state.messages = [] # Start fresh messages
-        # Add initial intro message and first question
-        st.session_state.messages.append({"role": "assistant", "content": STAGE_PROMPTS[STAGES["INIT"]], "type": "info"})
-        st.session_state.messages.append({"role": "assistant", "content": STAGE_PROMPTS[STAGES["GET_DIAGNOSIS"]]})
-        st.session_state.stage = STAGES["GET_DIAGNOSIS"] # Set the stage to the first question
-        st.session_state.drug_results = []; st.session_state.trial_results = []
-        st.session_state.consent_given = None # Use None, True, False
+        st.session_state.messages = []
+        st.session_state.drug_results = []
+        st.session_state.trial_results = []
+        st.session_state.consent_given = None
+        # Processing flags
+        st.session_state.drug_results_processed = False
+        st.session_state.trial_results_processed = False
+        st.session_state.contact_saved = False
+        st.session_state.final_summary_processed = False
+        # Configurable thresholds
+        st.session_state.drug_threshold = DRUG_RELEVANCE_THRESHOLD_DEFAULT
+        st.session_state.trial_threshold = TRIAL_RELEVANCE_THRESHOLD_DEFAULT
+        # Default Model
         if 'model_id' not in st.session_state:
-             st.session_state.model_id = AVAILABLE_MODELS.get(DEFAULT_MODEL_DISPLAY_NAME, list(AVAILABLE_MODELS.values())[0]) # Fallback if default name invalid
-        logging.info(f"Session state initialized to stage {STAGE_NAMES.get(st.session_state.stage, 'Unknown')}, model {st.session_state.model_id}.")
-    else:
-        # Ensure necessary keys exist even if session state was partially preserved from a previous state
-        if 'user_inputs' not in st.session_state: st.session_state.user_inputs = {}
-        if 'drug_results' not in st.session_state: st.session_state.drug_results = []
-        if 'trial_results' not in st.session_state: st.session_state.trial_results = []
-        if 'consent_given' not in st.session_state: st.session_state.consent_given = None
-        # Add the current prompt if the last message wasn't it (handles refresh on input stages)
-        current_prompt_text = STAGE_PROMPTS.get(st.session_state.stage)
-        # Avoid adding prompts for internal processing/end stages if they are already there
-        is_processing_stage = st.session_state.stage in [STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]
-        is_end_stage = st.session_state.stage == STAGES["END"]
+            st.session_state.model_id = DEFAULT_MODEL_ID
 
-        # Only append if the message list is empty OR the last message isn't the current prompt AND it's not a processing/end stage
-        if current_prompt_text and not is_processing_stage and not is_end_stage:
-             if not st.session_state.messages or st.session_state.messages[-1].get("content") != current_prompt_text:
-                 msg = {"role": "assistant", "content": current_prompt_text}
-                 if st.session_state.stage == STAGES["ASK_CONSENT"]: msg["type"] = "buttons"
-                 st.session_state.messages.append(msg)
-                 st.rerun()
+        # Initial prompts based on successful loading
+        if data_loaded_successfully:
+             st.session_state.messages.append({"role": "assistant", "content": STAGE_PROMPTS[STAGES["INIT"]], "type": "info"})
+             st.session_state.messages.append({"role": "assistant", "content": STAGE_PROMPTS[STAGES["GET_DIAGNOSIS"]]})
+             st.session_state.stage = STAGES["GET_DIAGNOSIS"]
+        else:
+             st.session_state.messages.append({"role": "assistant", "content": "⚠️ Application initialization failed. Cannot proceed.", "type": "error"})
+             st.session_state.stage = STAGES["END"]
 
+    # Ensure core keys exist if session persists partially
+    keys_defaults = {
+        'user_inputs': {}, 'drug_results': [], 'trial_results': [], 'consent_given': None,
+        'messages': [], 'model_id': DEFAULT_MODEL_ID, 'drug_threshold': DRUG_RELEVANCE_THRESHOLD_DEFAULT,
+        'trial_threshold': TRIAL_RELEVANCE_THRESHOLD_DEFAULT, 'drug_results_processed': False,
+        'trial_results_processed': False, 'contact_saved': False, 'final_summary_processed': False
+    }
+    for key, default_val in keys_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_val
 
 initialize_session()
 
 # --- Sidebar ---
 with st.sidebar:
     st.subheader("⚙️ Configuration")
+    # LLM Model Selector
     model_display_names = list(AVAILABLE_MODELS.keys())
-    current_model_id = st.session_state.get('model_id', AVAILABLE_MODELS.get(DEFAULT_MODEL_DISPLAY_NAME, list(AVAILABLE_MODELS.values())[0]))
-    current_model_display_name = next((name for name, mid in AVAILABLE_MODELS.items() if mid == current_model_id), DEFAULT_MODEL_DISPLAY_NAME)
+    current_model_display_name = next((name for name, mid in AVAILABLE_MODELS.items() if mid == st.session_state.model_id), DEFAULT_MODEL_DISPLAY_NAME)
     try: default_index = model_display_names.index(current_model_display_name)
-    except ValueError: default_index = 0 # Fallback if current model ID isn't in the list
-
-    selected_model_display_name = st.selectbox( "AI Model:", options=model_display_names, index=default_index, key="model_select_widget", help="Select AI model for query strategy and summary generation." )
+    except ValueError: default_index = 0
+    selected_model_display_name = st.selectbox(
+        "LLM Model:", options=model_display_names, index=default_index, key="model_select_widget",
+        help="AI model for summaries/explanations."
+    )
     new_model_id = AVAILABLE_MODELS[selected_model_display_name]
     if new_model_id != st.session_state.model_id:
-        st.session_state.model_id = new_model_id
-        st.toast(f"Model updated to: {selected_model_display_name}", icon="🤖")
-        logging.info(f"AI Model updated to {new_model_id}")
+        st.session_state.model_id = new_model_id; st.toast(f"LLM Model: {selected_model_display_name}", icon="🤖")
+        logging.info(f"LLM Model updated to {new_model_id}")
 
-
+    st.caption(f"Embedding: `{EMBEDDING_MODEL_NAME}`")
     st.divider()
-    if st.button("🔄 Restart Exploration", key="restart_sidebar"):
+    # Similarity Threshold Sliders
+    st.session_state.drug_threshold = st.slider(
+        "Drug Relevance Threshold", min_value=0.0, max_value=1.0,
+        value=st.session_state.drug_threshold, step=0.05,
+        help="Minimum similarity score (0-1) for a drug study to be considered relevant. Higher is stricter."
+    )
+    st.session_state.trial_threshold = st.slider(
+        "Trial Relevance Threshold", min_value=0.0, max_value=1.0,
+        value=st.session_state.trial_threshold, step=0.05,
+        help="Minimum similarity score (0-1) for a clinical trial to be considered relevant after filtering. Higher is stricter."
+    )
+    st.divider()
+    # Restart Button
+    if st.button("🔄 Restart Conversation", key="restart_sidebar"):
         logging.info("Restarting session from sidebar.")
-        # Clear ALL session state keys except essential config like model_id
-        keys_to_clear = [key for key in st.session_state.keys() if key not in ['model_id', 'model_select_widget']]
-        for key in keys_to_clear:
-            del st.session_state[key]
-        initialize_session() # Re-initialize state to starting point
+        keys_to_clear = [k for k in st.session_state.keys() if k not in ['model_id', 'model_select_widget']] # Keep LLM choice
+        for key in keys_to_clear: del st.session_state[key]
+        initialize_session()
         st.rerun()
-
-    st.divider(); st.markdown("---"); st.caption("Debug Info:")
+    st.divider()
+    st.markdown("---")
+    st.caption("Status Info:")
     current_stage_num = st.session_state.get('stage', STAGES["INIT"])
-    st.write(f"Current Stage: {STAGE_NAMES.get(current_stage_num, 'Unknown')} ({current_stage_num})")
-    st.write("Consent Given:", st.session_state.get('consent_given', 'N/A'))
-    # st.json(st.session_state.user_inputs) # Optional: uncomment for debugging inputs
-    # st.write("Drugs:", len(st.session_state.drug_results or [])) # Optional debug counts
-    # st.write("Trials:", len(st.session_state.trial_results or []))
+    st.write(f"Stage: {STAGE_NAMES.get(current_stage_num, 'Unknown')}")
+    st.write(f"Initialized: {'✅' if data_loaded_successfully else '❌'}")
 
+# --- Main App Area ---
 
-# --- Main App Area Layout ---
+# Header Section (Not sticky, but at the top)
+st.title("🧑‍⚕️ AI Drug & Trial Match")
+# st.caption("Explore information from study data. Discuss all findings with your healthcare provider.")
 
-# Fixed Header Area
-header_container = st.container()
-with header_container:
-    st.title("🧑‍⚕️ AI Treatment Match")
-    # st.caption("AI-Assisted Public Information Retrieval (Not Medical Advice)")
-    # # Add main disclaimer clearly
-    # st.markdown(
-    #     """
-    #     <div style="padding: 10px; border: 1px solid #ff9900; border-radius: 5px; margin-bottom: 10px; background-color: #fff3e0;">
-    #         ⚠️ <strong>Disclaimer:</strong> This application provides information based on publicly available data from the FDA and ClinicalTrials.gov. It is intended for informational exploration only and **does not constitute medical advice.** Consult with a qualified healthcare professional for any health concerns or before making any decisions related to your health or treatment.
-    #     </div>
-    #     """,
-    #     unsafe_allow_html=True
-    # )
-
-
-# Scrollable Chat Area
-chat_container = st.container(height=CHAT_CONTAINER_HEIGHT) # Scrollable chat area
-with chat_container:
-    # Display messages inside the scrollable container
+# Chat messages area (renders directly into the main flow)
+message_container = st.container() # Use a container just for logical grouping if needed, but not for height/scroll
+with message_container:
     for message in st.session_state.get('messages', []):
         avatar = ASSISTANT_AVATAR if message["role"] == "assistant" else USER_AVATAR
-        name = ASSISTANT_NAME if message["role"] == "assistant" else USER_NAME
         with st.chat_message(name=message["role"], avatar=avatar):
-            # Use markdown for message content, allowing HTML for expanders/info boxes
             if message.get("type") == "expander":
-                with st.expander(message.get("title", "Details"), expanded=False):
-                     # Use markdown within the expander content for formatting
-                     st.markdown(message["content"], unsafe_allow_html=True)
-            elif message.get("type") == "info":
-                 # Custom styling for info boxes like the initial disclaimer or end message
-                 st.markdown(message["content"], unsafe_allow_html=True)
-            else:
-                # Regular chat messages
-                st.markdown(message["content"], unsafe_allow_html=True)
+                with st.expander(message.get("title", "Details"), expanded=message.get("expanded", False)):
+                    st.markdown(message["content"], unsafe_allow_html=True)
+            elif message.get("type") == "info": st.info(message["content"])
+            elif message.get("type") == "warning": st.warning(message["content"])
+            elif message.get("type") == "error": st.error(message["content"])
+            else: st.markdown(message["content"], unsafe_allow_html=True)
 
 
-# --- Input/Button Area --- (Placed after scrollable area)
+# --- Stage Advancement & Input/Button Logic --- (Placed after messages)
 
-# Handle consent stage (buttons appear below chat_input implicitly)
-if st.session_state.stage == STAGES["ASK_CONSENT"]:
-    # Display the prompt above buttons if it's not the last message
-    current_prompt_text = STAGE_PROMPTS.get(st.session_state.stage)
-    if st.session_state.messages and st.session_state.messages[-1].get("content") != current_prompt_text:
-         st.write(current_prompt_text)
+def advance_stage(next_stage):
+    logging.info(f"Advancing stage: {STAGE_NAMES.get(st.session_state.stage)} -> {STAGE_NAMES.get(next_stage)}")
+    st.session_state.stage = next_stage
+    prompt = STAGE_PROMPTS.get(next_stage)
+    is_internal = next_stage in [STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]
+    if prompt and not is_internal and next_stage != STAGES["END"]: # Only add prompts for user-facing stages
+        msg = {"role": "assistant", "content": prompt}
+        if not st.session_state.messages or st.session_state.messages[-1].get("content") != prompt:
+             st.session_state.messages.append(msg)
 
-    cols = st.columns([1, 1, 6]) # Use columns to place buttons side-by-side
+# Input/Button Area Logic
+current_stage = st.session_state.stage
+
+# Consent Buttons
+if current_stage == STAGES["ASK_CONSENT"]:
+    st.write(STAGE_PROMPTS.get(STAGES["ASK_CONSENT"]))
+    cols = st.columns([1, 1, 6])
     with cols[0]:
-        if st.button("✔️ Yes, Agree", key="consent_yes"):
-            logging.info("User consented to contact info.")
-            st.session_state.consent_given = True
-            # Append user confirmation message
-            st.session_state.messages.append({"role": "user", "content": "A: Yes, I agree to share contact information."})
-            advance_stage(STAGES["GET_NAME"])
-            st.rerun()
+        if st.button("✔️ Yes", key="consent_yes"):
+            st.session_state.consent_given = True; st.session_state.messages.append({"role": "user", "content": "A: Yes"})
+            advance_stage(STAGES["GET_NAME"]); st.rerun()
     with cols[1]:
-         if st.button("❌ No, Decline", key="consent_no"):
-            logging.info("User declined contact info.")
-            st.session_state.consent_given = False
-            # Append user confirmation message
-            st.session_state.messages.append({"role": "user", "content": "A: No, I do not wish to share contact information now."})
-            # Save user context even without contact details (for record-keeping demo)
-            context_data = {
-                "ConsentGiven": False,
-                "Diagnosis": st.session_state.user_inputs.get("diagnosis", "N/A"),
-                "StageProgression": st.session_state.user_inputs.get("stage", "N/A"),
-                "Biomarkers": st.session_state.user_inputs.get("biomarkers", "N/A"),
-                "PriorTreatment": st.session_state.user_inputs.get("prior_treatment", "N/A"),
-                "ImagingResponse": st.session_state.user_inputs.get("imaging", "N/A")
-            }
-            save_user_data(context_data) # Attempt to save context
-            advance_stage(STAGES["SHOW_TRIALS_NO_CONSENT"]) # Skip contact info steps
-            st.rerun()
+         if st.button("❌ No", key="consent_no"):
+            st.session_state.consent_given = False; st.session_state.messages.append({"role": "user", "content": "A: No"})
+            context_data = {k: st.session_state.user_inputs.get(k, "N/A") for k in ["diagnosis", "stage", "biomarkers", "prior_treatment", "imaging"]}
+            context_data["ConsentGiven"] = False; save_user_data(context_data)
+            advance_stage(STAGES["SHOW_TRIALS_NO_CONSENT"]); st.rerun()
 
-# Handle text input stage
-elif st.session_state.stage not in [STAGES["ASK_CONSENT"], STAGES["END"], STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]:
-    current_prompt_text = STAGE_PROMPTS.get(st.session_state.stage, "Enter your response...")
-    # Extract example text for placeholder
-    placeholder_match = re.search(r"\((e\.g\.,.*?)\)", current_prompt_text)
-    placeholder = placeholder_match.group(1) if placeholder_match else "Your answer..."
-
-    user_input = st.chat_input(placeholder=placeholder, key="user_text_input") # Use st.chat_input
-
-    # Process user input if available and not in a processing/final stage
-    if user_input: # Only process if input is given
+# Text Input Stages
+elif current_stage not in [STAGES["ASK_CONSENT"], STAGES["END"], STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]:
+    prompt_text = STAGE_PROMPTS.get(current_stage, "Enter response...")
+    placeholder = re.search(r"\((e\.g\.,.*?)\)", prompt_text)
+    placeholder = placeholder.group(1) if placeholder else "Your answer..."
+    user_input = st.chat_input(placeholder=placeholder, key=f"chat_input_{current_stage}")
+    if user_input:
         st.session_state.messages.append({"role": "user", "content": f"A: {user_input}"})
-        current_stage = st.session_state.stage
         next_stage = None
-
-        # --- Stage advancement logic based on current stage ---
-        if current_stage == STAGES["GET_DIAGNOSIS"]:
-            st.session_state.user_inputs['diagnosis'] = user_input.strip()
-            next_stage = STAGES["GET_STAGE"]
-        elif current_stage == STAGES["GET_STAGE"]:
-            st.session_state.user_inputs['stage'] = user_input.strip()
-            next_stage = STAGES["GET_BIOMARKERS"]
-        elif current_stage == STAGES["GET_BIOMARKERS"]:
-            st.session_state.user_inputs['biomarkers'] = user_input.strip()
-            next_stage = STAGES["GET_PRIOR_TREATMENT"]
-        elif current_stage == STAGES["GET_PRIOR_TREATMENT"]:
-            st.session_state.user_inputs['prior_treatment'] = user_input.strip()
-            next_stage = STAGES["GET_IMAGING"]
-        elif current_stage == STAGES["GET_IMAGING"]:
-            st.session_state.user_inputs['imaging'] = user_input.strip()
-            # After imaging, we go to the processing stage for drugs
-            next_stage = STAGES["PROCESS_INFO_SHOW_DRUGS"]
-        elif current_stage == STAGES["GET_NAME"]:
-            st.session_state.user_inputs['name'] = user_input.strip()
-            next_stage = STAGES["GET_EMAIL"]
+        if current_stage == STAGES["GET_DIAGNOSIS"]: st.session_state.user_inputs['diagnosis'] = user_input.strip(); next_stage = STAGES["GET_STAGE"]
+        elif current_stage == STAGES["GET_STAGE"]: st.session_state.user_inputs['stage'] = user_input.strip(); next_stage = STAGES["GET_BIOMARKERS"]
+        elif current_stage == STAGES["GET_BIOMARKERS"]: st.session_state.user_inputs['biomarkers'] = user_input.strip(); next_stage = STAGES["GET_PRIOR_TREATMENT"]
+        elif current_stage == STAGES["GET_PRIOR_TREATMENT"]: st.session_state.user_inputs['prior_treatment'] = user_input.strip(); next_stage = STAGES["GET_IMAGING"]
+        elif current_stage == STAGES["GET_IMAGING"]: st.session_state.user_inputs['imaging'] = user_input.strip(); next_stage = STAGES["PROCESS_INFO_SHOW_DRUGS"]
+        elif current_stage == STAGES["GET_NAME"]: st.session_state.user_inputs['name'] = user_input.strip(); next_stage = STAGES["GET_EMAIL"]
         elif current_stage == STAGES["GET_EMAIL"]:
-            # Basic email validation
-            if "@" not in user_input or "." not in user_input:
-                st.session_state.messages.append({"role": "assistant", "content": "⚠️ Please enter a valid email address."})
-                # Stay on the current stage to re-ask - no next_stage change
-            else:
-                st.session_state.user_inputs['email'] = user_input.strip()
-                next_stage = STAGES["GET_PHONE"]
-        elif current_stage == STAGES["GET_PHONE"]:
-             st.session_state.user_inputs['phone'] = user_input.strip() if user_input.strip() else "N/A" # Handle empty input for optional phone
-             # After phone, we go to the save contact stage
-             next_stage = STAGES["SAVE_CONTACT_SHOW_TRIALS"]
+            if "@" not in user_input or "." not in user_input.split('@')[-1]: st.session_state.messages.append({"role": "assistant", "content": "⚠️ Please enter a valid email.", "type":"warning"})
+            else: st.session_state.user_inputs['email'] = user_input.strip(); next_stage = STAGES["GET_PHONE"]
+        elif current_stage == STAGES["GET_PHONE"]: st.session_state.user_inputs['phone'] = user_input.strip() if user_input.strip() else "N/A"; next_stage = STAGES["SAVE_CONTACT_SHOW_TRIALS"]
+        if next_stage is not None: advance_stage(next_stage); st.rerun()
 
-        # Advance stage if next_stage is determined by the logic
-        if next_stage is not None:
-            advance_stage(next_stage)
-            st.rerun()
+# Processing Stages
+elif current_stage == STAGES["PROCESS_INFO_SHOW_DRUGS"]:
+    if not st.session_state.get("drug_results_processed", False):
+        with st.spinner("Finding relevant drug studies..."):
+            user_inputs = st.session_state.user_inputs
+            try:
+                # Use threshold from session state
+                st.session_state.drug_results = find_relevant_drugs_local(
+                    df_drugs=df_drugs_processed, drug_embeddings=drug_embeddings_array, model=embedding_model,
+                    user_cancer_type_raw=user_inputs.get("diagnosis", ""), user_stage_raw=user_inputs.get("stage", ""),
+                    user_biomarkers_raw=user_inputs.get("biomarkers", ""),
+                    relevance_threshold=st.session_state.drug_threshold, # Use state value
+                    max_results=MAX_DRUGS_TO_DISPLAY
+                )
+                with st.spinner("Generating summary & interpretations..."):
+                    drug_list_summary = generate_drug_summary_llm(user_inputs, st.session_state.drug_results, st.session_state.model_id)
+                    st.session_state.messages.append({"role": "assistant", "content": f"**Drug Study Findings:**\n\n{drug_list_summary}"})
+                    if st.session_state.drug_results:
+                        st.session_state.messages.append({"role": "assistant", "content": f"Details for top {len(st.session_state.drug_results)} studies:", "type": "info"})
+                        for i, drug in enumerate(st.session_state.drug_results):
+                            interpretation = generate_result_interpretation_llm("drug", drug, user_inputs, st.session_state.model_id)
+                            title = f"#{i+1}: {drug.get('Drug Name', 'N/A')} (Rel: {drug.get('semantic_similarity', 0):.2f})"
+                            content = f"**Drug:** {drug.get('Drug Name', 'N/A')}\n**Study Cancer Type:** {drug.get('Cancer Type', 'N/A')}\n"
+                            content += f"**Outcomes:** OS Tx:`{drug.get('Treatment_OS', 'N/A')}` vs Ctrl:`{drug.get('Control_OS', 'N/A')}` ({drug.get('OS_Improvement (%)', 'N/A')}); PFS Tx:`{drug.get('Treatment_PFS', 'N/A')}` vs Ctrl:`{drug.get('Control_PFS', 'N/A')}` ({drug.get('PFS_Improvement (%)', 'N/A')})\n\n"
+                            google_url = f"https://www.google.com/search?q={drug.get('Drug Name', '').replace(' ', '+')}+{drug.get('Cancer Type', '').replace(' ', '+')}+clinical+study"
+                            content += f"🔗 [Search Google]({google_url})\n\n**AI Interpretation:**\n> {interpretation}\n"
+                            st.session_state.messages.append({"role": "assistant", "content": content, "type": "expander", "title": title, "expanded": i < 1})
+                st.session_state.drug_results_processed = True
+                advance_stage(STAGES["ASK_CONSENT"]); st.rerun()
+            except Exception as e:
+                logging.error("Error during drug processing:", exc_info=True); st.error(f"Drug analysis error: {e}")
+                st.session_state.messages.append({"role": "assistant", "content": "Could not complete drug analysis.", "type": "error"})
+                st.session_state.drug_results_processed = True; advance_stage(STAGES["ASK_CONSENT"]); st.rerun()
 
+elif current_stage == STAGES["SAVE_CONTACT_SHOW_TRIALS"]:
+    if st.session_state.consent_given is True and not st.session_state.get("contact_saved", False):
+        contact_data = {k: st.session_state.user_inputs.get(k, "N/A") for k in ["name", "email", "phone", "diagnosis", "stage", "biomarkers", "prior_treatment", "imaging"]}
+        contact_data["ConsentGiven"] = True
+        if save_user_data(contact_data): st.toast("Contact info recorded.", icon="✅"); st.session_state.messages.append({"role": "assistant", "content": "Contact info recorded.", "type": "info"})
+        else: st.toast("Failed to save contact info.", icon="⚠️"); st.session_state.messages.append({"role": "assistant", "content": "⚠️ Issue saving contact info.", "type": "warning"})
+        st.session_state.contact_saved = True
+    advance_stage(STAGES["SHOW_TRIALS_NO_CONSENT"]); st.rerun()
 
-# --- Internal Processing Stages (Triggered by st.rerun after stage change) ---
+elif current_stage == STAGES["SHOW_TRIALS_NO_CONSENT"]:
+    if not st.session_state.get("trial_results_processed", False):
+        with st.spinner("Finding relevant clinical trials..."):
+            user_inputs = st.session_state.user_inputs
+            try:
+                # Use threshold from session state
+                st.session_state.trial_results = find_relevant_trials_local(
+                    df_trials=df_trials_processed, trial_embeddings=trial_embeddings_array, index_to_embedding_index=trial_index_map, model=embedding_model,
+                    user_cancer_type_raw=user_inputs.get("diagnosis", ""), user_stage_raw=user_inputs.get("stage", ""),
+                    user_biomarkers_raw=user_inputs.get("biomarkers", ""),
+                    relevance_threshold=st.session_state.trial_threshold, # Use state value
+                    max_results=MAX_TRIALS_TO_DISPLAY
+                )
+                with st.spinner("Generating summary & interpretations..."):
+                    trial_list_summary = generate_trial_summary_llm(user_inputs, st.session_state.trial_results, st.session_state.model_id)
+                    st.session_state.messages.append({"role": "assistant", "content": f"**Clinical Trial Findings:**\n\n{trial_list_summary}"})
+                    if st.session_state.trial_results:
+                        st.session_state.messages.append({"role": "assistant", "content": f"Details for top {len(st.session_state.trial_results)} trials:", "type": "info"})
+                        for i, trial in enumerate(st.session_state.trial_results):
+                            interpretation = generate_result_interpretation_llm("trial", trial, user_inputs, st.session_state.model_id)
+                            title = f"#{i+1}: {trial.get('nct_id', 'N/A')} - {trial.get('status', 'N/A')} (Rel: {trial.get('semantic_similarity', 0):.2f})"
+                            content = f"**NCT ID:** {trial.get('nct_id', 'N/A')} | **Title:** {trial.get('title', 'N/A')}\n"
+                            content += f"**Status:** `{trial.get('status', 'N/A')}` | **Phase:** `{trial.get('phases', 'N/A')}`\n"
+                            content += f"**Conditions:** {trial.get('conditions', 'N/A')} | **Intervention(s):** {trial.get('interventions', 'N/A')}\n\n"
+                            if trial.get('url', '#') != '#': content += f"🔗 [View on ClinicalTrials.gov]({trial.get('url')})\n\n"
+                            content += f"**AI Interpretation:**\n> {interpretation}\n"
+                            st.session_state.messages.append({"role": "assistant", "content": content, "type": "expander", "title": title, "expanded": i < 1})
+                st.session_state.trial_results_processed = True
+                advance_stage(STAGES["FINAL_SUMMARY"]); st.rerun()
+            except Exception as e:
+                logging.error("Error during trial processing:", exc_info=True); st.error(f"Trial analysis error: {e}")
+                st.session_state.messages.append({"role": "assistant", "content": "Could not complete trial analysis.", "type": "error"})
+                st.session_state.trial_results_processed = True; advance_stage(STAGES["FINAL_SUMMARY"]); st.rerun()
 
-if st.session_state.stage == STAGES["PROCESS_INFO_SHOW_DRUGS"]:
-    logging.info("Executing stage: PROCESS_INFO_SHOW_DRUGS")
-    # Ensure user inputs are available
-    user_inputs = st.session_state.user_inputs
-    diagnosis = user_inputs.get("diagnosis", "cancer")
-    stage_info = user_inputs.get("stage", "")
-    markers = user_inputs.get("biomarkers", "")
-    model_id = st.session_state.model_id
+elif current_stage == STAGES["FINAL_SUMMARY"]:
+    if not st.session_state.get("final_summary_processed", False):
+        with st.spinner("Generating final summary..."):
+            try:
+                final_summary = generate_final_summary_llm(st.session_state.user_inputs, st.session_state.drug_results, st.session_state.trial_results, st.session_state.model_id)
+                st.session_state.messages.append({"role": "assistant", "content": f"**Final Summary:**\n\n{final_summary}"})
+            except Exception as e:
+                 logging.error("Error generating final summary", exc_info=True); st.error(f"Final summary generation error: {e}")
+                 st.session_state.messages.append({"role": "assistant", "content": "Could not generate final summary.", "type": "error"})
+        st.session_state.final_summary_processed = True
+        advance_stage(STAGES["END"]); st.rerun()
 
-    # Only run API/LLM calls once per stage transition
-    # Check if drug results are already stored OR if the drug summary message is already present
-    if not st.session_state.drug_results and not any(m.get("content", "").strip().startswith("**Potential Therapeutics") for m in st.session_state.messages):
-        try:
-            st.session_state.messages.append({"role": "assistant", "content": "Analyzing your information and searching for relevant FDA-approved drugs..."})
-            with st.spinner("Generating advanced FDA search strategy and searching database..."):
-                search_strategy = refine_fda_search_strategy_with_llm(diagnosis, stage_info, markers, model_id)
-                st.session_state.drug_results = search_fda_drugs_for_condition_and_markers(search_strategy)
-
-            # Generate LLM summary BEFORE showing details
-            drug_summary = generate_drug_summary_llm(diagnosis, markers, st.session_state.drug_results, model_id)
-            st.session_state.messages.append({"role": "assistant", "content": f"**Potential Therapeutics (Based on FDA Label Search)**\n\n{drug_summary}"})
-
-            # Add expander message with details if results found
-            if st.session_state.drug_results:
-                num_found = len(st.session_state.drug_results)
-                expander_title = f"View {num_found} Found Drug Detail{'s' if num_found != 1 else ''}"
-                expander_content = f"**Found {num_found} potentially relevant drug(s):**\n"
-                expander_content += f"*_Search based on FDA 'Indications & Usage' for: {diagnosis}, {markers}, {stage_info}_*\n\n"
-
-                for i, drug in enumerate(st.session_state.drug_results):
-                    expander_content += f"\n---\n**{i+1}. {drug.get('brand_name', 'N/A')}** ({drug.get('generic_name', 'N/A')})\n\n"
-                    expander_content += f"   *   **Indication Snippet:** {drug.get('indication_snippet', 'N/A')}\n"
-                    if drug.get('url') and drug.get('url') != '#':
-                        # Add link inside expander
-                        expander_content += f"   *   **More Info:** [Search Google for Prescribing Information]({drug.get('url')})\n"
-
-                st.session_state.messages.append({"role": "assistant", "content": expander_content.strip(), "type": "expander", "title": expander_title})
-            else:
-                 st.session_state.messages.append({"role": "assistant", "content": "No specific FDA-approved drugs matching the search criteria were found. Please review your input or consult with your physician."})
-
-
-        except Exception as e:
-            logging.error("Error during PROCESS_INFO_SHOW_DRUGS stage", exc_info=True)
-            st.error(f"An error occurred during drug analysis: {e}")
-            st.session_state.messages.append({"role": "assistant", "content": "Could not complete the drug analysis due to an error. Please try restarting."})
-
-        # Always advance after processing drugs (either successfully or after error)
-        # Check if the next stage message is already present before adding it again
-        if not st.session_state.messages or st.session_state.messages[-1].get("content") != STAGE_PROMPTS.get(STAGES["ASK_CONSENT"]):
-            advance_stage(STAGES["ASK_CONSENT"])
-            st.rerun()
-
-
-if st.session_state.stage == STAGES["SAVE_CONTACT_SHOW_TRIALS"]:
-    logging.info("Executing stage: SAVE_CONTACT_SHOW_TRIALS")
-    # This stage is only reached if consent was given and contact info was gathered
-    if st.session_state.consent_given:
-        # Only save once per stage transition
-        if not any(m.get("content", "").strip().startswith("Thank you! Your contact information has been recorded") or m.get("content", "").strip().startswith("⚠️ There was an issue recording your contact information") for m in st.session_state.messages):
-            contact_data = {
-                "ConsentGiven": True,
-                "Name": st.session_state.user_inputs.get("name", "N/A"),
-                "Email": st.session_state.user_inputs.get("email", "N/A"),
-                "Phone": st.session_state.user_inputs.get("phone", "N/A"),
-                "Diagnosis": st.session_state.user_inputs.get("diagnosis", "N/A"),
-                "StageProgression": st.session_state.user_inputs.get("stage", "N/A"),
-                "Biomarkers": st.session_state.user_inputs.get("biomarkers", "N/A"),
-                "PriorTreatment": st.session_state.user_inputs.get("prior_treatment", "N/A"),
-                "ImagingResponse": st.session_state.user_inputs.get("imaging", "N/A"),
-            }
-            if save_user_data(contact_data):
-                st.toast("Contact info recorded.", icon="✅")
-                st.session_state.messages.append({"role": "assistant", "content": "Thank you! Your contact information has been recorded."})
-            else:
-                st.toast("Failed to save contact info.", icon="⚠️")
-                st.session_state.messages.append({"role": "assistant", "content": "⚠️ There was an issue recording your contact information."})
-
-    # Always proceed to show trials after attempting save (or if consent wasn't given via this path)
-    advance_stage(STAGES["SHOW_TRIALS_NO_CONSENT"])
-    st.rerun()
-
-
-if st.session_state.stage == STAGES["SHOW_TRIALS_NO_CONSENT"]: # This stage is reached either after declining consent or after saving contact info
-    logging.info("Executing stage: SHOW_TRIALS_NO_CONSENT (Show Trials)")
-    # Ensure user inputs are available
-    user_inputs = st.session_state.user_inputs
-    diagnosis = user_inputs.get("diagnosis", "cancer")
-    stage_info = user_inputs.get("stage", "")
-    markers = user_inputs.get("biomarkers", "")
-    prior_treatment = user_inputs.get("prior_treatment", "")
-    model_id = st.session_state.model_id
-
-    # Only run API/LLM calls once per stage transition
-    # Check if trial results are already stored OR if the trial summary message is already present
-    if not st.session_state.trial_results and not any(m.get("content", "").strip().startswith("**Potential Clinical Trials") for m in st.session_state.messages):
-        try:
-            st.session_state.messages.append({"role": "assistant", "content": "Searching ClinicalTrials.gov for relevant studies using AI-generated keywords..."})
-            with st.spinner("Generating search terms and searching ClinicalTrials.gov database..."):
-                 # Use the new function that calls LLM for keywords and then searches
-                 st.session_state.trial_results = search_clinical_trials_with_keywords(diagnosis, stage_info, markers, prior_treatment, model_id, limit=CT_REQUEST_LIMIT)
-
-            # Generate LLM summary BEFORE showing details
-            trial_summary = generate_trial_summary_llm(diagnosis, markers, stage_info, st.session_state.trial_results, model_id)
-            st.session_state.messages.append({"role": "assistant", "content": f"**Potential Clinical Trials (Keyword Search)**\n\n{trial_summary}"})
-
-            # Add expander message with details if results found
-            if st.session_state.trial_results:
-                num_found = len(st.session_state.trial_results)
-                num_to_display = min(num_found, CT_DISPLAY_LIMIT)
-                expander_title = f"View Top {num_to_display} (of {num_found}) Clinical Trial Detail{'s' if num_to_display != 1 else ''}"
-                expander_content = f"**Found {num_found} potentially relevant trial(s), showing top {num_to_display}:**\n\n"
-                # Clarification based on using only query.term with LLM keywords
-                # expander_content += f"*_Search based on AI-generated keywords derived from your input (e.g., diagnosis, markers, stage, 'recruiting', 'phase 2/3/4', 'interventional'). Results are sorted by relevance by the API._*\n"
-                # expander_content += f"*_Always verify details, eligibility criteria, and locations on ClinicalTrials.gov via the link._*\n"
-
-
-                for i, trial in enumerate(st.session_state.trial_results[:num_to_display]): # Limit displayed results in expander
-                    expander_content += f"\n---\n**{i+1}. {trial.get('nct_id', 'N/A')}: {trial.get('title', 'N/A')}**\n\n"
-                    # Using Markdown list format for details
-                    expander_content += f"-   **Status:** {trial.get('status','N/A')}\n"
-                    expander_content += f"-   **Phase:** {trial.get('phase','N/A')}\n"
-                    expander_content += f"-   **Type:** {trial.get('study_type','N/A')}\n"
-                    expander_content += f"-   **Conditions:** {trial.get('conditions','N/A')}\n"
-                    expander_content += f"-   **Interventions:** {trial.get('interventions','N/A')}\n"
-                    # Add eligibility, locations snippets if available
-                    if trial.get('eligibility_snippet') and trial['eligibility_snippet'] != 'N/A':
-                         expander_content += f"-   **Eligibility Snippet:** {trial.get('eligibility_snippet')}\n"
-                    if trial.get('locations_snippet') and trial['locations_snippet'] != 'N/A':
-                         expander_content += f"-   **Locations Snippet:** {trial.get('locations_snippet')}\n"
-
-                    if trial.get('url') and trial.get('url') != '#':
-                         # Add link inside expander
-                         expander_content += f"-   **Link:** [View Full Details on ClinicalTrials.gov]({trial.get('url')})\n"
-                    # Add summary last
-                    if trial.get('summary') and trial['summary'] != 'N/A':
-                         expander_content += f"-   **Summary:** {trial.get('summary')}\n"
-
-
-                st.session_state.messages.append({"role": "assistant", "content": expander_content.strip(), "type": "expander", "title": expander_title})
-            else:
-                 st.session_state.messages.append({"role": "assistant", "content": "No clinical trials matching the keyword search criteria were found. Please review your input, try broader terms, or consult with your physician."})
-
-        except Exception as e:
-            logging.error("Error during SHOW_TRIALS_NO_CONSENT stage", exc_info=True)
-            st.error(f"An error occurred during clinical trial analysis: {e}")
-            st.session_state.messages.append({"role": "assistant", "content": "Could not complete the clinical trial analysis due to an error. Please try restarting."})
-
-        # Always advance after showing trials (either successfully or after error)
-        # Check if the next stage message is already present before adding it again
-        if not st.session_state.messages or st.session_state.messages[-1].get("content") != STAGE_PROMPTS.get(STAGES["FINAL_SUMMARY"]):
-             advance_stage(STAGES["FINAL_SUMMARY"])
-             st.rerun()
-
-
-if st.session_state.stage == STAGES["FINAL_SUMMARY"]:
-    logging.info("Executing stage: FINAL_SUMMARY")
-    # Only generate final summary once per stage transition
-    # Check if the final summary message is already present (distinguished by starting with "**Final Summary**")
-    final_summary_already_generated = any(
-        m["role"] == "assistant" and m["content"].strip().startswith("**Final Summary**")
-        for m in st.session_state.messages[-2:] # Check last couple of messages
-    )
-
-    # Add "Generating..." message if it hasn't been added yet for this transition
-    generating_message_text = STAGE_PROMPTS.get(STAGES["FINAL_SUMMARY"])
-    generating_message_present = (st.session_state.messages and st.session_state.messages[-1].get("content") == generating_message_text)
-
-    if not generating_message_present and not final_summary_already_generated:
-        st.session_state.messages.append({"role": "assistant", "content": generating_message_text})
-        st.rerun() # Rerun to display the generating message
-        # After this rerun, the script will re-execute and enter this stage again,
-        # and `generating_message_present` will be True.
-
-    # Now, if the generating message is present BUT the final summary isn't yet,
-    # generate and display the final summary.
-    if generating_message_present and not final_summary_already_generated:
-         try:
-             final_summary = generate_final_summary_llm(
-                 st.session_state.user_inputs,
-                 st.session_state.drug_results,
-                 st.session_state.trial_results,
-                 st.session_state.model_id
-             )
-             # Append the final summary message after generation
-             st.session_state.messages.append({"role": "assistant", "content": f"**Final Summary**\n\n{final_summary}"})
-
-         except Exception as e:
-              logging.error("Error generating final summary", exc_info=True)
-              st.error(f"An error occurred while generating the final summary: {e}")
-              st.session_state.messages.append({"role": "assistant", "content": "Could not generate the final summary due to an error. Please review the details above and consult your physician."})
-
-         # Always advance to END stage after attempting final summary generation
-         advance_stage(STAGES["END"])
-         st.rerun() # Rerun to trigger the END stage logic for displaying the final END message and button
-    # If the final summary IS already generated, and we are in this stage,
-    # the next logical step is the END stage, which will be handled by the subsequent check/block.
-
-
-if st.session_state.stage == STAGES["END"]:
-    logging.info("Reached END stage.")
-    # Display the end prompt if it's not already the last message
+# End Stage - Display final message and restart button
+elif current_stage == STAGES["END"]:
     end_prompt_text = STAGE_PROMPTS.get(STAGES["END"])
-    # Check last 2 messages in case final summary was just added before it
-    end_message_present = any(m.get('content') == end_prompt_text for m in st.session_state.messages[-2:])
-
-    if not end_message_present:
-        # Add it as an info box for clear separation
-         st.session_state.messages.append({"role": "assistant", "content": end_prompt_text, "type":"info"})
-         st.rerun() # Rerun to display the added end message
-
-    # Offer restart button below the chat area
-    # This button will only be rendered when stage is END
-    st.info("Session ended. Use the sidebar or button below to start a new exploration.")
-    if st.button("🔄 Start New Exploration", key="restart_main_button"):
-        logging.info("Restarting session from main button.")
-        # Clear ALL session state keys except essential config like model_id
-        keys_to_clear = [key for key in st.session_state.keys() if key not in ['model_id', 'model_select_widget']]
-        for key in keys_to_clear:
-            del st.session_state[key]
-        initialize_session() # Re-initialize state to starting point
+    # Ensure end message is the last one
+    if not st.session_state.messages or st.session_state.messages[-1].get("content") != end_prompt_text:
+        st.session_state.messages.append({"role": "assistant", "content": end_prompt_text, "type": "info"})
         st.rerun()
+    else:
+        # Display restart button only after the end message is shown
+        st.info("Use the sidebar or button below to start a new exploration.")
+        if st.button("🔄 Start New Exploration", key="restart_main"):
+            logging.info("Restarting session from main button.")
+            keys_to_clear = [k for k in st.session_state.keys() if k not in ['model_id', 'model_select_widget']]
+            for key in keys_to_clear: del st.session_state[key]
+            initialize_session(); st.rerun()

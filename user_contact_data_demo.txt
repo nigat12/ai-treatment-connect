@@ -277,3 +277,36 @@
     Imaging: No
 --- End Entry ---
 
+--- Contact Entry: 2025-05-01 04:48:57 ---
+  Consent Given: True
+  Name: N/A
+  Email: N/A
+  Phone: N/A
+  Context:
+    Diagnosis: N/A
+    StageProgression: N/A
+    Biomarkers: N/A
+    PriorTreatment: N/A
+    Imaging: N/A
+--- End Entry ---
+
+--- Contact Entry: 2025-05-01 05:04:57 ---
+  Consent Given: False
+  Context:
+    Diagnosis: N/A
+    StageProgression: N/A
+    Biomarkers: N/A
+    PriorTreatment: N/A
+    Imaging: N/A
+--- End Entry ---
+
+--- Contact Entry: 2025-05-01 05:12:17 ---
+  Consent Given: False
+  Context:
+    Diagnosis: N/A
+    StageProgression: N/A
+    Biomarkers: N/A
+    PriorTreatment: N/A
+    Imaging: N/A
+--- End Entry ---
+
