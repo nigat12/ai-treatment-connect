@@ -54,3 +54,4 @@ sentence-transformers
 openpyxl
 hf_xet
 langchain-anthropic
+geopy
