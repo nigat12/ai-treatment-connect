@@ -53,5 +53,6 @@ watchdog==6.0.0
 sentence-transformers
 openpyxl
 hf_xet
+langchain
 langchain-anthropic
 geopy
