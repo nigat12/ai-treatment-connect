@@ -1,123 +1,115 @@
 # -*- coding: utf-8 -*-
+# --------------------------------------------------------------------------
+# AI Drug & Trial Match (Interactive Assistant)
+# --------------------------------------------------------------------------
+
+# 1. SET PAGE CONFIG FIRST - THIS IS CRITICAL
 import streamlit as st
-import pandas as pd
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import re
+st.set_page_config(
+    page_title="AI Drug & Trial Match",
+    page_icon="🧑‍⚕️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://www.example.com/help', # Replace with actual help URL
+        'Report a bug': "https://www.example.com/bug", # Replace with actual bug report URL
+        'About': """
+        ## AI Drug & Trial Match Assistant
+        This application helps explore information about cancer drugs and clinical trials.
+        **Disclaimer:** This tool is for informational purposes only and does not provide medical advice.
+        Always consult with a qualified healthcare professional for medical concerns.
+        """
+    }
+)
+
+# --- Standard Library Imports ---
 import os
-from groq import Groq, RateLimitError, APIError
-from dotenv import load_dotenv
 import json
 import logging
+import re
+import time
+import pickle
+import math
+import ast # For safely evaluating string representation of list/tuples
 from datetime import datetime
 import textwrap
-import math
-import time
-import pickle # For saving/loading index map
 
-# --- Configuration & Setup ---
+# --- Third-party Library Imports ---
+import pandas as pd
+import numpy as np
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Configure logging
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+
+from langchain_anthropic import ChatAnthropic
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain.memory import ConversationBufferWindowMemory # Not directly used in agent_executor, but for manual history
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain.pydantic_v1 import BaseModel, Field
+
+# --- Application Configuration & Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Load environment variables
 load_dotenv()
 
-# CRITICAL: Check if Groq API key is loaded
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    st.error("🚨 FATAL ERROR: GROQ_API_KEY not found. Please set it in your .env file or environment variables and restart.")
-    logging.critical("GROQ_API_KEY not found. Application cannot proceed.")
+# --- API Key Check ---
+# This must come AFTER st.set_page_config()
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    st.error(
+        "🚨 **FATAL ERROR: ANTHROPIC_API_KEY not found!**\n\n"
+        "Please set the `ANTHROPIC_API_KEY` environment variable in your `.env` file "
+        "or system environment and restart the application."
+    )
+    logging.critical("ANTHROPIC_API_KEY not found. Application cannot proceed.")
     st.stop()
 
 # --- File Paths ---
 DRUG_DATA_CSV = 'drug_data.csv'
-TRIAL_DATA_XLSX = 'trials.xlsx'
+TRIAL_DATA_XLSX = 'trials_filtered_with_coordinates.xlsx' # Ensure this has 'location_coordinates'
 DRUG_EMBEDDINGS_FILE = 'drug_embeddings.npy'
 TRIAL_EMBEDDINGS_FILE = 'trial_embeddings.npy'
 TRIAL_INDEX_MAP_FILE = 'trial_index_map.pkl'
+GEOCODE_CACHE_FILE_PATH = "geocode_cache.json"
+TEMP_GEOCODE_CACHE_FILE_PATH = "geocode_cache.tmp.json"
 
-# Insecure contact saving path (function retained, warnings removed from UI)
-USER_DATA_FILE = "user_contact_data_demo.txt"
-
-# --- Constants for Matching & UI ---
-EMBEDDING_MODEL_NAME = 'all-MiniLM-L6-v2'
+# --- Constants ---
+EMBEDDING_MODEL_NAME = 'neuml/pubmedbert-base-embeddings'
 DRUG_TEXT_COLUMNS_FOR_EMBEDDING = ['Cancer Type']
-TRIAL_TEXT_COLUMNS_FOR_EMBEDDING = ['Conditions']
+TRIAL_TEXT_COLUMNS_FOR_EMBEDDING = ['Study Type', 'Conditions']
 
-# Default Thresholds (User configurable via sidebar)
-DRUG_RELEVANCE_THRESHOLD_DEFAULT = 0.50
-TRIAL_RELEVANCE_THRESHOLD_DEFAULT = 0.50
-
-# Trial Filtering Criteria
 TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN = 'Primary Outcome Measures'
 TRIAL_FILTER_PRIMARY_OUTCOME_TERM = 'Overall Survival'
 TRIAL_FILTER_PHASES_COLUMN = 'Phases'
-TRIAL_ACCEPTABLE_PHASES = ['PHASE1|PHASE2', 'PHASE2', 'PHASE2|PHASE3', 'PHASE3', 'PHASE4']
+TRIAL_ACCEPTABLE_PHASES_STR = ['PHASE1|PHASE2', 'PHASE2', 'PHASE2|PHASE3', 'PHASE3', 'PHASE4']
 TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES = set()
-for phase_combo in TRIAL_ACCEPTABLE_PHASES:
+for phase_combo in TRIAL_ACCEPTABLE_PHASES_STR:
     for phase in re.split(r'[|/,\s]+', phase_combo):
         if phase: TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES.add(phase.strip().upper())
-
 TRIAL_FILTER_STUDY_TYPE_COLUMN = 'Study Type'
 TRIAL_FILTER_STUDY_TYPE_VALUE = 'INTERVENTIONAL'
 
-# Display Limits
-MAX_DRUGS_TO_DISPLAY = 10
-MAX_TRIALS_TO_DISPLAY = 10
+CLAUDE_MODEL_NAME = "claude-3-5-haiku-latest" # Fast and capable
+DEFAULT_SEARCH_RADIUS_MILES = 50
 
-# UI Constants
+# IMPORTANT: Update NOMINATIM_USER_AGENT for geocoding
+NOMINATIM_USER_AGENT = "ai_health_connect/1.1" # PLEASE UPDATE to unique string
+API_REQUEST_DELAY_SECONDS = 1.05
+API_TIMEOUT_SECONDS = 15
+
 ASSISTANT_AVATAR = "🧑‍⚕️"
 USER_AVATAR = "👤"
-ASSISTANT_NAME = "Assistant"
-USER_NAME = "You"
-# CHAT_CONTAINER_HEIGHT removed - using single page scroll
 
-# --- Available Groq Models ---
-AVAILABLE_MODELS = {
-    "Llama 3 70B": "llama3-70b-8192",
-    "Llama 3 8B": "llama3-8b-8192",
-    "DeepSeek R1 Distill Llama 70B": "deepseek-r1-distill-llama-70b",
-    "Gemma 2 Instruct": "gemma2-9b-it",
-    "Mistral Saba 24B": "mistral-saba-24b",
-}
-DEFAULT_MODEL_DISPLAY_NAME = "Llama 3 70B"
-DEFAULT_MODEL_ID = AVAILABLE_MODELS.get(DEFAULT_MODEL_DISPLAY_NAME, list(AVAILABLE_MODELS.values())[0])
-
-# --- Chatbot Questions & Stages ---
-STAGES = {
-    "INIT": 0, "GET_DIAGNOSIS": 1, "GET_STAGE": 2, "GET_BIOMARKERS": 3,
-    "GET_PRIOR_TREATMENT": 4, "GET_IMAGING": 5, "PROCESS_INFO_SHOW_DRUGS": 6,
-    "ASK_CONSENT": 7, "GET_NAME": 8, "GET_EMAIL": 9, "GET_PHONE": 10,
-    "SAVE_CONTACT_SHOW_TRIALS": 11, "SHOW_TRIALS_NO_CONSENT": 12,
-    "FINAL_SUMMARY": 13, "END": 14
-}
-
-STAGE_PROMPTS = {
-    STAGES["INIT"]: "Welcome! I can help explore potential treatment options based on study data. Please provide some details to begin.\n\nFirst: 👇",
-    STAGES["GET_DIAGNOSIS"]: "Q: What is the primary diagnosis? (e.g., Breast Cancer)",
-    STAGES["GET_STAGE"]: "Q: What is the stage or progression? (e.g., Stage IV, Metastatic)",
-    STAGES["GET_BIOMARKERS"]: "Q: Are there any known biomarkers? (e.g., HR-positive). List them or type 'None'.",
-    STAGES["GET_PRIOR_TREATMENT"]: "Q: What treatments have been received previously? (e.g., Chemotherapy, Immunotherapy)",
-    STAGES["GET_IMAGING"]: "Q: Any recent imaging results indicating current status? (e.g., Stable disease, Progression)",
-    STAGES["ASK_CONSENT"]: "Q: Would you like to save your query context and contact information for potential follow-up?",
-    STAGES["GET_NAME"]: "Q: Please enter your First and Last Name:",
-    STAGES["GET_EMAIL"]: "Q: Please enter your Email Address:",
-    STAGES["GET_PHONE"]: "Q: Please enter your Phone Number (optional):",
-    STAGES["END"]: "Exploration complete. Please remember to discuss all findings and options with your healthcare provider."
-    # Internal stages removed, handled by logic/spinners
-}
-
-STAGE_NAMES = {v: k for k, v in STAGES.items()}
-
-# --- Helper Functions (Parsing, Sorting, Saving) ---
-# (parse_time_to_months, parse_improvement_percentage, sort_key_with_none, check_phases, save_user_data, get_llm_client remain unchanged from previous version)
-
+# --- Helper Functions (Parsing, Sorting) ---
 def parse_time_to_months(time_str):
     if isinstance(time_str, (int, float)): return float(time_str)
     if not isinstance(time_str, str): return None
-    time_str = time_str.strip().lower()
+    time_str = str(time_str).strip().lower()
     if time_str in ['n/a', 'not applicable', 'not reported', 'not reached', 'nr', '', 'nan']: return None
     match_months = re.match(r'(\d+(\.\d+)?)\s*m', time_str)
     if match_months: return float(match_months.group(1))
@@ -129,7 +121,7 @@ def parse_time_to_months(time_str):
 def parse_improvement_percentage(perc_str):
     if isinstance(perc_str, (int, float)): return float(perc_str)
     if not isinstance(perc_str, str): return None
-    perc_str = perc_str.strip().lower()
+    perc_str = str(perc_str).strip().lower()
     if perc_str in ['n/a', 'not applicable', 'not reported', 'not statistically significant', 'nss', '', 'nan']: return None
     match = re.match(r'(-?\d+(\.\d+)?)\s*%', perc_str)
     if match: return float(match.group(1))
@@ -137,619 +129,563 @@ def parse_improvement_percentage(perc_str):
     except ValueError: return None
 
 def sort_key_with_none(value, reverse=True):
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    is_none_or_nan = value is None or (isinstance(value, float) and math.isnan(value))
+    if is_none_or_nan:
         return float('-inf') if reverse else float('inf')
     try: return float(value)
     except (ValueError, TypeError): return float('-inf') if reverse else float('inf')
 
 def check_phases(trial_phases_raw):
-    if not isinstance(trial_phases_raw, str) or not trial_phases_raw.strip(): return False
-    trial_individual_phases = re.split(r'[|/,\s]+', trial_phases_raw.strip())
-    for phase in trial_individual_phases:
-        if phase.strip().upper() in TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES:
-            return True
-    return False
+    if not isinstance(trial_phases_raw, str) or not str(trial_phases_raw).strip(): return False
+    trial_individual_phases = re.split(r'[|/,\s]+', str(trial_phases_raw).strip())
+    return any(phase.strip().upper() in TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES for phase in trial_individual_phases if phase)
 
-def save_user_data(data):
-    try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(USER_DATA_FILE, "a", encoding="utf-8") as f:
-            f.write(f"--- Contact Entry: {timestamp} ---\n")
-            f.write(f"  Consent Given: {data.get('ConsentGiven', 'N/A')}\n")
-            if data.get('ConsentGiven') is True:
-                f.write(f"  Name: {data.get('Name', 'N/A')}\n")
-                f.write(f"  Email: {data.get('Email', 'N/A')}\n")
-                f.write(f"  Phone: {data.get('Phone', 'N/A')}\n")
-            f.write(f"  Context:\n")
-            f.write(f"    Diagnosis: {data.get('Diagnosis', 'N/A')}\n")
-            f.write(f"    StageProgression: {data.get('StageProgression', 'N/A')}\n")
-            f.write(f"    Biomarkers: {data.get('Biomarkers', 'N/A')}\n")
-            f.write(f"    PriorTreatment: {data.get('PriorTreatment', 'N/A')}\n")
-            f.write(f"    Imaging: {data.get('ImagingResponse', 'N/A')}\n")
-            f.write(f"--- End Entry ---\n\n")
-        logging.info(f"User data appended to {USER_DATA_FILE}")
-        return True
-    except IOError as e:
-        logging.error(f"IOError saving user data to {USER_DATA_FILE}: {e}", exc_info=True)
-        st.error("Could not save contact information due to a file system error.")
-        return False
-    except Exception as e:
-        logging.error(f"Unexpected error saving user data: {e}", exc_info=True)
-        st.error("An unexpected error occurred while saving contact information.")
-        return False
-
-def get_llm_client():
-    try:
-        return Groq(api_key=GROQ_API_KEY)
-    except Exception as e:
-        logging.critical(f"Failed to initialize Groq client: {e}", exc_info=True)
-        st.error("FATAL ERROR: Could not initialize AI client.")
-        st.stop()
-
-# --- Caching and Data/Embedding Loading Functions ---
-# (load_sentence_transformer_model, load_and_preprocess_drug_data, get_or_generate_drug_embeddings,
-#  load_and_preprocess_trial_data, get_or_generate_trial_embeddings remain unchanged from previous version)
-
-@st.cache_resource(show_spinner="Loading embedding model...")
+# --- Data Loading and Preprocessing Functions ---
+@st.cache_resource(show_spinner="Initializing AI model...")
 def load_sentence_transformer_model(model_name=EMBEDDING_MODEL_NAME):
     try:
-        logging.info(f"Loading Sentence Transformer model: {model_name}")
         model = SentenceTransformer(model_name)
-        logging.info(f"Model {model_name} loaded.")
+        logging.info(f"Embedding model '{model_name}' loaded.")
         return model
     except Exception as e:
-        logging.error(f"Error loading Sentence Transformer model '{model_name}': {e}", exc_info=True)
-        st.error(f"Failed to load the embedding model ({model_name}).")
-        st.stop()
+        logging.error(f"Fatal: Error loading Sentence Transformer model '{model_name}': {e}", exc_info=True)
+        # This error will be caught by the main data loading try-except block
+        raise RuntimeError(f"Failed to load embedding model: {e}")
 
 @st.cache_data(show_spinner="Loading drug data...")
 def load_and_preprocess_drug_data(csv_path):
     try:
-        logging.info(f"Loading drug data from {csv_path}")
         df = pd.read_csv(csv_path)
-        logging.info(f"Drug data loaded. Shape: {df.shape}")
-        missing_cols = [col for col in DRUG_TEXT_COLUMNS_FOR_EMBEDDING if col not in df.columns]
-        if missing_cols: raise ValueError(f"Missing required columns in {csv_path}: {missing_cols}")
+        if not all(col in df.columns for col in DRUG_TEXT_COLUMNS_FOR_EMBEDDING):
+            raise ValueError(f"Missing required columns in {csv_path}")
         df['combined_text_for_embedding'] = df[DRUG_TEXT_COLUMNS_FOR_EMBEDDING].fillna('').astype(str).agg(' '.join, axis=1)
+        # Add other parsing as needed for display by LLM or sorting
         df['Treatment_OS_Months_Parsed'] = df.get('Treatment_OS', pd.Series([None]*len(df))).apply(parse_time_to_months)
         df['Control_OS_Months_Parsed'] = df.get('Control_OS', pd.Series([None]*len(df))).apply(parse_time_to_months)
-        df['OS_Improvement_Percentage_Parsed'] = df.get('OS_Improvement (%)', pd.Series([None]*len(df))).apply(parse_improvement_percentage)
-        df['Treatment_PFS_Months_Parsed'] = df.get('Treatment_PFS', pd.Series([None]*len(df))).apply(parse_time_to_months)
-        df['Control_PFS_Months_Parsed'] = df.get('Control_PFS', pd.Series([None]*len(df))).apply(parse_time_to_months)
-        df['PFS_Improvement_Percentage_Parsed'] = df.get('PFS_Improvement (%)', pd.Series([None]*len(df))).apply(parse_improvement_percentage)
-        df['Calculated_OS_Improvement_Months'] = df.apply(lambda row: row['Treatment_OS_Months_Parsed'] - row['Control_OS_Months_Parsed'] if pd.notna(row['Treatment_OS_Months_Parsed']) and pd.notna(row['Control_OS_Months_Parsed']) else None, axis=1)
-        df['Calculated_PFS_Improvement_Months'] = df.apply(lambda row: row['Treatment_PFS_Months_Parsed'] - row['Control_PFS_Months_Parsed'] if pd.notna(row['Treatment_PFS_Months_Parsed']) and pd.notna(row['Control_PFS_Months_Parsed']) else None, axis=1)
-        logging.info("Drug data preprocessing complete.")
-        return df.fillna('N/A')
-    except FileNotFoundError: logging.error(f"Drug data file not found: {csv_path}"); st.error(f"ERROR: Drug data file ({csv_path}) not found."); st.stop()
-    except ValueError as ve: logging.error(f"ValueError processing drug data: {ve}", exc_info=True); st.error(f"ERROR: Problem processing drug data file ({csv_path}). Details: {ve}"); st.stop()
-    except Exception as e: logging.error(f"Unexpected error loading/processing drug data {csv_path}: {e}", exc_info=True); st.error(f"An unexpected error occurred loading drug data from {csv_path}."); st.stop()
+        df = df.fillna('N/A')
+        logging.info(f"Drug data loaded and preprocessed. Shape: {df.shape}")
+        return df
+    except Exception as e:
+        logging.error(f"Fatal: Error loading/processing drug data '{csv_path}': {e}", exc_info=True)
+        raise RuntimeError(f"Failed to load drug data: {e}")
 
+@st.cache_data(show_spinner="Generating/loading drug embeddings...")
 def get_or_generate_drug_embeddings(_drug_df, _model, embeddings_path=DRUG_EMBEDDINGS_FILE):
     if os.path.exists(embeddings_path):
         try:
-            logging.info(f"Loading existing drug embeddings from {embeddings_path}")
             embeddings = np.load(embeddings_path)
             if embeddings.shape[0] == len(_drug_df) and embeddings.shape[1] == _model.get_sentence_embedding_dimension():
-                 logging.info("Drug embeddings loaded successfully.")
-                 return embeddings
-            else: logging.warning(f"Loaded drug embeddings shape mismatch. Regenerating.")
-        except Exception as e: logging.error(f"Error loading drug embeddings: {e}. Regenerating.", exc_info=True)
-    logging.info("Generating new drug embeddings...")
+                logging.info("Drug embeddings loaded from cache.")
+                return embeddings
+            logging.warning("Drug embeddings shape mismatch. Regenerating.")
+        except Exception as e:
+            logging.error(f"Error loading drug embeddings: {e}. Regenerating.", exc_info=True)
     try:
-        texts_to_embed = _drug_df['combined_text_for_embedding'].tolist()
-        if not texts_to_embed: logging.warning("No text in drug data for embedding."); return np.array([])
-        embeddings = _model.encode(texts_to_embed, show_progress_bar=True, convert_to_numpy=True)
-        logging.info("Drug embeddings generated.")
-        try: np.save(embeddings_path, embeddings); logging.info(f"Drug embeddings saved to {embeddings_path}")
-        except Exception as e: logging.error(f"Error saving drug embeddings: {e}", exc_info=True); st.warning(f"Could not save generated drug embeddings.")
+        texts = _drug_df['combined_text_for_embedding'].tolist()
+        if not texts: return np.array([])
+        embeddings = _model.encode(texts, show_progress_bar=False, convert_to_numpy=True) # No progress bar in st context
+        np.save(embeddings_path, embeddings)
+        logging.info("Drug embeddings generated and saved.")
         return embeddings
-    except Exception as e: logging.error(f"Error generating drug embeddings: {e}", exc_info=True); st.error("Error generating drug embeddings."); return np.array([])
+    except Exception as e:
+        logging.error(f"Fatal: Error generating drug embeddings: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to generate drug embeddings: {e}")
 
-@st.cache_data(show_spinner="Loading trial data...")
+@st.cache_data(show_spinner="Loading clinical trial data...")
 def load_and_preprocess_trial_data(xlsx_path):
     try:
-        logging.info(f"Loading trial data from {xlsx_path}")
         df = pd.read_excel(xlsx_path)
-        logging.info(f"Trial data loaded. Shape: {df.shape}")
-        missing_cols = [col for col in TRIAL_TEXT_COLUMNS_FOR_EMBEDDING if col not in df.columns]
-        if missing_cols: raise ValueError(f"Missing required columns in {xlsx_path}: {missing_cols}")
+        if not all(col in df.columns for col in TRIAL_TEXT_COLUMNS_FOR_EMBEDDING):
+            raise ValueError(f"Missing required columns in {xlsx_path}")
         df['combined_text_for_embedding'] = df[TRIAL_TEXT_COLUMNS_FOR_EMBEDDING].fillna('').astype(str).agg(' '.join, axis=1)
-        if TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN in df.columns: df[TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN] = df[TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN].fillna('').astype(str)
-        if TRIAL_FILTER_PHASES_COLUMN in df.columns: df[TRIAL_FILTER_PHASES_COLUMN] = df[TRIAL_FILTER_PHASES_COLUMN].fillna('').astype(str)
-        if TRIAL_FILTER_STUDY_TYPE_COLUMN in df.columns: df[TRIAL_FILTER_STUDY_TYPE_COLUMN] = df[TRIAL_FILTER_STUDY_TYPE_COLUMN].fillna('').astype(str)
-        logging.info("Trial data preprocessing complete.")
-        return df.fillna('N/A')
-    except FileNotFoundError: logging.error(f"Trial data file not found: {xlsx_path}"); st.error(f"ERROR: Trial data file ({xlsx_path}) not found."); st.stop()
-    except ValueError as ve: logging.error(f"ValueError processing trial data: {ve}", exc_info=True); st.error(f"ERROR: Problem processing trial data file ({xlsx_path}). Details: {ve}"); st.stop()
-    except Exception as e: logging.error(f"Unexpected error loading/processing trial data {xlsx_path}: {e}", exc_info=True); st.error(f"An unexpected error occurred loading trial data from {xlsx_path}."); st.stop()
 
+        if 'location_coordinates' in df.columns:
+            def parse_excel_coords(coord_str_val):
+                if pd.isna(coord_str_val) or not isinstance(coord_str_val, str) or not coord_str_val.strip(): return []
+                try:
+                    parsed = ast.literal_eval(coord_str_val)
+                    if isinstance(parsed, list):
+                        return [tuple(item) for item in parsed if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(num, (int, float)) for num in item)]
+                    return []
+                except (ValueError, SyntaxError, TypeError): return []
+            df['parsed_location_coordinates'] = df['location_coordinates'].apply(parse_excel_coords)
+        else:
+            logging.warning("'location_coordinates' column not found in trial data. Location-based search will be impaired.")
+            df['parsed_location_coordinates'] = pd.Series([[] for _ in range(len(df))]) # Empty list for all rows
+        
+        df = df.fillna('N/A')
+        logging.info(f"Trial data loaded and preprocessed. Shape: {df.shape}")
+        return df
+    except Exception as e:
+        logging.error(f"Fatal: Error loading/processing trial data '{xlsx_path}': {e}", exc_info=True)
+        raise RuntimeError(f"Failed to load trial data: {e}")
+
+@st.cache_data(show_spinner="Generating/loading trial embeddings...")
 def get_or_generate_trial_embeddings(_trial_df, _model, embeddings_path=TRIAL_EMBEDDINGS_FILE, map_path=TRIAL_INDEX_MAP_FILE):
-    embeddings, index_map = None, None
     if os.path.exists(embeddings_path) and os.path.exists(map_path):
         try:
-            logging.info(f"Loading existing trial embeddings/map")
             embeddings = np.load(embeddings_path)
             with open(map_path, 'rb') as f: index_map = pickle.load(f)
-            if embeddings is not None and index_map is not None and \
-               embeddings.shape[0] == len(index_map) and \
-               embeddings.shape[1] == _model.get_sentence_embedding_dimension() and \
-               max(index_map.keys(), default=-1) < len(_trial_df):
-                 logging.info("Trial embeddings/map loaded successfully.")
-                 return embeddings, index_map
-            else: logging.warning(f"Trial embeddings/map shape mismatch or invalid data. Regenerating."); embeddings, index_map = None, None
-        except Exception as e: logging.error(f"Error loading trial embeddings/map: {e}. Regenerating.", exc_info=True); embeddings, index_map = None, None
-    logging.info("Generating new trial embeddings and index map...")
+            if (embeddings is not None and index_map is not None and
+                embeddings.shape[0] == len(index_map) and
+                embeddings.shape[1] == _model.get_sentence_embedding_dimension() and
+                (max(index_map.keys(), default=-1) < len(_trial_df) if index_map else True)): # Check map keys if map not empty
+                logging.info("Trial embeddings and index map loaded from cache.")
+                return embeddings, index_map
+            logging.warning("Trial embeddings/map mismatch. Regenerating.")
+        except Exception as e:
+            logging.error(f"Error loading trial embeddings/map: {e}. Regenerating.", exc_info=True)
     try:
-        non_empty_mask = _trial_df['combined_text_for_embedding'].str.strip() != ''
-        non_empty_indices = _trial_df.index[non_empty_mask].tolist()
-        texts_to_embed = _trial_df.loc[non_empty_indices, 'combined_text_for_embedding'].tolist()
-        if not texts_to_embed: logging.warning("No non-empty text in trial data for embedding."); return np.array([]), {}
-        embeddings = _model.encode(texts_to_embed, show_progress_bar=True, convert_to_numpy=True)
-        index_map = {original_idx: emb_idx for emb_idx, original_idx in enumerate(non_empty_indices)}
-        logging.info("Trial embeddings/map generated.")
-        try:
-            np.save(embeddings_path, embeddings)
-            with open(map_path, 'wb') as f: pickle.dump(index_map, f)
-            logging.info(f"Trial embeddings/map saved.")
-        except Exception as e: logging.error(f"Error saving trial embeddings/map: {e}", exc_info=True); st.warning("Could not save generated trial embeddings/map.")
+        mask = _trial_df['combined_text_for_embedding'].str.strip() != ''
+        indices = _trial_df.index[mask].tolist()
+        texts = _trial_df.loc[indices, 'combined_text_for_embedding'].tolist()
+        if not texts: return np.array([]), {}
+        embeddings = _model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+        index_map = {original_idx: emb_idx for emb_idx, original_idx in enumerate(indices)}
+        np.save(embeddings_path, embeddings)
+        with open(map_path, 'wb') as f: pickle.dump(index_map, f)
+        logging.info("Trial embeddings/map generated and saved.")
         return embeddings, index_map
-    except Exception as e: logging.error(f"Error generating trial embeddings: {e}", exc_info=True); st.error("Error generating trial embeddings."); return np.array([]), {}
+    except Exception as e:
+        logging.error(f"Fatal: Error generating trial embeddings: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to generate trial embeddings: {e}")
 
-
-# --- Local Matching Functions ---
-# Pass session_state threshold values to these functions
-
-def find_relevant_drugs_local(df_drugs: pd.DataFrame, drug_embeddings: np.ndarray, model: SentenceTransformer,
-                              user_cancer_type_raw: str, user_stage_raw: str, user_biomarkers_raw: str,
-                              relevance_threshold: float, # Now passed as argument
-                              max_results: int = MAX_DRUGS_TO_DISPLAY):
-    logging.info("Starting local drug search...")
-    if drug_embeddings.size == 0: logging.warning("Drug embeddings empty."); return []
-    user_biomarkers_list = [b.strip() for b in user_biomarkers_raw.split(',') if b.strip()]
-    user_query_text = f"{user_cancer_type_raw} {user_stage_raw} {' '.join(user_biomarkers_list)}".strip()
-    logging.info(f"Drug query: '{user_query_text}', Threshold: {relevance_threshold:.2f}")
-    if not user_query_text: logging.warning("User drug query empty."); return []
-    try: user_embedding = model.encode(user_query_text, convert_to_numpy=True)
-    except Exception as e: logging.error(f"Error generating drug query embedding: {e}", exc_info=True); st.warning("Could not generate query embedding."); return []
-    potential_results = []
-    try: similarities = cosine_similarity([user_embedding], drug_embeddings)[0]
-    except ValueError as e: logging.error(f"Error calculating drug similarities: {e}", exc_info=True); st.error("Error comparing query to drug data."); return []
-    for index, row in df_drugs.iterrows():
-        if index >= len(similarities): logging.warning(f"Drug index {index} out of bounds for similarities."); continue
-        semantic_sim = similarities[index]
-        if semantic_sim >= relevance_threshold:
-            result_dict = {'index': index, 'semantic_similarity': semantic_sim, **row.to_dict()} # Include all columns
-            potential_results.append(result_dict)
-    potential_results.sort(key=lambda x: (
-        sort_key_with_none(x['semantic_similarity'], reverse=True),
-        sort_key_with_none(x.get('Calculated_OS_Improvement_Months'), reverse=True),
-        sort_key_with_none(x.get('OS_Improvement_Percentage_Parsed') is not None, reverse=True),
-        sort_key_with_none(x.get('OS_Improvement_Percentage_Parsed'), reverse=True),
-        sort_key_with_none(x.get('PFS_Improvement_Percentage_Parsed') is not None, reverse=True),
-        sort_key_with_none(x.get('PFS_Improvement_Percentage_Parsed'), reverse=True),
-    ), reverse=False)
-    potential_results.reverse()
-    logging.info(f"Found {len(potential_results)} relevant drugs passing threshold {relevance_threshold:.2f}.")
-    return potential_results[:max_results]
-
-def find_relevant_trials_local(df_trials: pd.DataFrame, trial_embeddings: np.ndarray, index_to_embedding_index: dict,
-                               model: SentenceTransformer,
-                               user_cancer_type_raw: str, user_stage_raw: str, user_biomarkers_raw: str,
-                               relevance_threshold: float, # Now passed as argument
-                               max_results: int = MAX_TRIALS_TO_DISPLAY):
-    logging.info("Starting local trial search...")
-    if trial_embeddings.size == 0 or not index_to_embedding_index: logging.warning("Trial embeddings/map empty."); return []
-    user_biomarkers_list = [b.strip() for b in user_biomarkers_raw.split(',') if b.strip()]
-    user_query_text = f"{user_cancer_type_raw} {user_stage_raw} {' '.join(user_biomarkers_list)}".strip()
-    logging.info(f"Trial query: '{user_query_text}', Threshold: {relevance_threshold:.2f}")
-    if not user_query_text: logging.warning("User trial query empty."); return []
-    try: user_embedding = model.encode(user_query_text, convert_to_numpy=True)
-    except Exception as e: logging.error(f"Error generating trial query embedding: {e}", exc_info=True); st.warning("Could not generate query embedding."); return []
-    potential_results = []
-    for index, row in df_trials.iterrows():
-        primary_outcome_text = row.get(TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN, 'N/A').lower()
-        if TRIAL_FILTER_PRIMARY_OUTCOME_TERM.lower() not in primary_outcome_text: continue
-        trial_phases_raw = row.get(TRIAL_FILTER_PHASES_COLUMN, 'N/A')
-        if not check_phases(trial_phases_raw): continue
-        trial_study_type = row.get(TRIAL_FILTER_STUDY_TYPE_COLUMN, 'N/A').upper()
-        if trial_study_type != TRIAL_FILTER_STUDY_TYPE_VALUE.upper(): continue
-        if index not in index_to_embedding_index: continue
-        embedding_index = index_to_embedding_index[index]
-        if embedding_index >= len(trial_embeddings): continue
-        try: semantic_sim = cosine_similarity([user_embedding], [trial_embeddings[embedding_index]])[0][0]
-        except ValueError as e: logging.error(f"Error calculating trial similarity for index {index}: {e}", exc_info=True); continue
-        except Exception as e: logging.error(f"Unexpected error calculating similarity for trial index {index}: {e}", exc_info=True); continue
-        if semantic_sim >= relevance_threshold:
-            result_dict = {
-                'index': index, 'semantic_similarity': semantic_sim,
-                'nct_id': row.get('NCT Number', 'N/A'), 'title': row.get('Study Title', 'N/A'),
-                'status': row.get('Study Status', 'N/A'), 'conditions': row.get('Conditions', 'N/A'),
-                'interventions': row.get('Interventions', 'N/A'), 'phases': trial_phases_raw,
-                'brief_summary': row.get('Brief Summary', 'N/A'),
-                'primary_outcome': row.get(TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN, 'N/A'),
-                'study_type': trial_study_type,
-                'url': f"https://clinicaltrials.gov/study/{row.get('NCT Number', '')}" if row.get('NCT Number', 'N/A') != 'N/A' else "#"
-            }
-            potential_results.append(result_dict)
-    phase_order = {'PHASE4': 5, 'PHASE3': 4, 'PHASE2|PHASE3': 3, 'PHASE2': 2, 'PHASE1|PHASE2': 1}
-    def get_phase_sort_value(phases_raw):
-        if not isinstance(phases_raw, str): return 0
-        highest_phase_val = 0
-        individual_phases = re.split(r'[|/,\s]+', phases_raw.strip().upper())
-        for phase in individual_phases: highest_phase_val = max(highest_phase_val, phase_order.get(phase, 0))
-        return highest_phase_val
-    potential_results.sort(key=lambda x: (
-        sort_key_with_none(x['semantic_similarity'], reverse=True),
-        get_phase_sort_value(x.get('phases')),
-        0 if 'recruiting' in str(x.get('status', '')).lower() else 1
-    ), reverse=True)
-    logging.info(f"Found {len(potential_results)} relevant trials passing filters/threshold {relevance_threshold:.2f}.")
-    return potential_results[:max_results]
-
-
-# --- LLM Generation Functions ---
-# (generate_llm_response, generate_drug_summary_llm, generate_trial_summary_llm,
-#  generate_result_interpretation_llm, generate_final_summary_llm remain unchanged from previous version)
-
-def generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=300, temperature=0.2):
-    try:
-        chat_completion = client.chat.completions.create(messages=[{"role": "system", "content": system_prompt},{"role": "user", "content": user_prompt}], model=model_id, temperature=temperature, max_tokens=max_tokens)
-        response = chat_completion.choices[0].message.content
-        response = response.strip().replace("```json", "").replace("```", "").strip()
-        unwanted_phrases = ["Here is the summary:", "Summary:", "Here's the interpretation:", "Interpretation:", "Okay, here's the explanation:", "Explanation:"]
-        for phrase in unwanted_phrases:
-             if response.lower().startswith(phrase.lower()): response = response[len(phrase):].strip()
-        return response
-    except RateLimitError as e: logging.error(f"Groq Rate Limit Error: {e}", exc_info=True); st.warning("AI assistant unavailable (rate limit)."); return "Error: AI assistant rate limit."
-    except APIError as e: logging.error(f"Groq API Error: {e}", exc_info=True); st.warning(f"AI assistant API error ({e.status_code})."); return f"Error: AI assistant API error ({e.status_code})."
-    except Exception as e: logging.error(f"Unexpected LLM error: {e}", exc_info=True); st.warning("Unexpected error contacting AI assistant."); return "Error: Unexpected AI issue."
-
-def generate_drug_summary_llm(user_inputs, drug_results, model_id):
-    logging.info(f"[LLM Call - Drug Summary] For {len(drug_results)} drugs.")
-    client = get_llm_client()
-    if not drug_results: return f"No matching drug studies found for: Diagnosis '{user_inputs.get('diagnosis', 'N/A')}', Stage '{user_inputs.get('stage', 'N/A')}', Biomarkers '{user_inputs.get('biomarkers', 'N/A')}'."
-    drug_list_str = "\n".join([f"- {d.get('Drug Name', 'N/A')} (Sim: {d.get('semantic_similarity', 0):.2f})" for d in drug_results[:5]])
-    if len(drug_results) > 5: drug_list_str += f"\n- ...and {len(drug_results) - 5} more."
-    system_prompt = "Summarize drug study findings concisely based on relevance. Do NOT give medical advice. Mention number found and basis (similarity, outcome)."
-    user_prompt = f"""User Input: Dx="{user_inputs.get('diagnosis', 'N/A')}", Stg="{user_inputs.get('stage', 'N/A')}", Bio="{user_inputs.get('biomarkers', 'N/A')}" Found {len(drug_results)} relevant studies. Top: {drug_list_str} Provide a brief (2-3 sentences) summary. State number found/basis. Mention ranking (relevance, OS/PFS). Advise review/consult doctor."""
-    summary = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=250)
-    logging.info(f"LLM drug summary: {summary}")
-    return summary
-
-def generate_trial_summary_llm(user_inputs, trial_results, model_id):
-    logging.info(f"[LLM Call - Trial Summary] For {len(trial_results)} trials.")
-    client = get_llm_client()
-    if not trial_results: return f"No matching trials found after filters (Outcome: OS, Phase 2+, Interventional) and relevance for: Dx '{user_inputs.get('diagnosis', 'N/A')}', Stg '{user_inputs.get('stage', 'N/A')}', Bio '{user_inputs.get('biomarkers', 'N/A')}'."
-    recruiting_count = sum(1 for t in trial_results if 'recruiting' in t.get('status', '').lower())
-    trial_list_str = "\n".join([f"- {t.get('nct_id', 'N/A')}: {t.get('title', 'N/A')} (Sts: {t.get('status', 'N/A')}, Ph: {t.get('phases', 'N/A')}, Sim: {t.get('semantic_similarity', 0):.2f})" for t in trial_results[:5]])
-    if len(trial_results) > 5: trial_list_str += f"\n- ...and {len(trial_results) - 5} more."
-    system_prompt = "Summarize trial findings concisely based on filters/relevance. Do NOT give medical advice. Mention number found, recruiting count, basis (filters + relevance)."
-    user_prompt = f"""User Input: Dx="{user_inputs.get('diagnosis', 'N/A')}", Stg="{user_inputs.get('stage', 'N/A')}", Bio="{user_inputs.get('biomarkers', 'N/A')}" Found {len(trial_results)} relevant trials after filters (Outcome: '{TRIAL_FILTER_PRIMARY_OUTCOME_TERM}', Phase: {TRIAL_ACCEPTABLE_PHASES}, Type: '{TRIAL_FILTER_STUDY_TYPE_VALUE}') & sim. threshold. {recruiting_count} recruiting. Top: {trial_list_str} Provide brief (2-3 sentences) summary. State number found/basis. Mention recruiting count. Advise review/consult doctor."""
-    summary = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=300)
-    logging.info(f"LLM trial summary: {summary}")
-    return summary
-
-def generate_result_interpretation_llm(result_type, result_data, user_context, model_id):
-    logging.info(f"[LLM Call - Interpretation] For {result_type}: {result_data.get('Drug Name') or result_data.get('nct_id')}")
-    client = get_llm_client()
-    system_prompt = f"Explain clinical study findings ({result_type}). Interpret OS, PFS, phase, status objectively. CRITICAL: NO MEDICAL ADVICE. State info needs discussion with doctor. Focus ONLY on data provided for this result. Concise (3-5 sentences). Explain OS (Overall Survival), PFS (Progression-Free Survival)."
-    user_prompt = f"User Context: Dx: {user_context.get('diagnosis', 'N/A')}, Stg: {user_context.get('stage', 'N/A')}, Bio: {user_context.get('biomarkers', 'N/A')}\n\n"
-    if result_type == "drug":
-        user_prompt += f"Drug Study:\nDrug: {result_data.get('Drug Name', 'N/A')} | Relevance: {result_data.get('semantic_similarity', 0):.3f}\nSummary: {textwrap.shorten(result_data.get('Brief Study Summary', 'N/A'), width=200)}\n"
-        user_prompt += f"OS: Tx=`{result_data.get('Treatment_OS', 'N/A')}`, Ctrl=`{result_data.get('Control_OS', 'N/A')}`, Imprv=`{result_data.get('OS_Improvement (%)', 'N/A')}` (Calc Months: {result_data.get('Calculated_OS_Improvement_Months', 'N/A')})\n"
-        user_prompt += f"PFS: Tx=`{result_data.get('Treatment_PFS', 'N/A')}`, Ctrl=`{result_data.get('Control_PFS', 'N/A')}`, Imprv=`{result_data.get('PFS_Improvement (%)', 'N/A')}`\n\n"
-        user_prompt += f"Explain these results for {result_data.get('Drug Name', 'N/A')}. Define OS/PFS. Indicate suggested improvement vs control (avoid certainty). Mention relevance score source. Advise doctor discussion."
-    elif result_type == "trial":
-        user_prompt += f"Trial:\nNCT: {result_data.get('nct_id', 'N/A')} | Relevance: {result_data.get('semantic_similarity', 0):.3f}\nTitle: {result_data.get('title', 'N/A')}\n"
-        user_prompt += f"Status: `{result_data.get('status', 'N/A')}` | Phase: `{result_data.get('phases', 'N/A')}`\nCond: {result_data.get('conditions', 'N/A')} | Interv: {result_data.get('interventions', 'N/A')}\n"
-        user_prompt += f"Prim Outcome Focus ('{TRIAL_FILTER_PRIMARY_OUTCOME_TERM}'): Yes\nSummary: {textwrap.shorten(result_data.get('brief_summary', 'N/A'), width=200)}\n\n"
-        user_prompt += f"Explain trial {result_data.get('nct_id', 'N/A')}. Explain Status (e.g., Recruiting) & Phase (e.g., Phase 3). Mention relevance score source. State trial goal. Advise doctor discussion on eligibility."
-    else: return "Error: Invalid result type."
-    interpretation = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=400, temperature=0.3)
-    logging.info(f"LLM interpretation: {interpretation}")
-    return interpretation
-
-def generate_final_summary_llm(user_inputs, drug_results, trial_results, model_id):
-    logging.info(f"[LLM Call - Final Summary]")
-    client = get_llm_client()
-    drug_count = len(drug_results); trial_count = len(trial_results)
-    recruiting_trial_count = sum(1 for t in trial_results if 'recruiting' in t.get('status', '').lower())
-    drug_summary_part = f"{drug_count} drug studies identified." if drug_count > 0 else "No matching drug studies found."
-    trial_summary_part = f"{trial_count} trials identified ({recruiting_trial_count} recruiting)." if trial_count > 0 else "No matching trials found."
-    system_prompt = "Provide final summary of findings. Be professional, concise. Strongly emphasize need for medical consultation."
-    user_prompt = f"""User Context: Dx: {user_inputs.get("diagnosis", "N/A")}, Stg: {user_inputs.get("stage", "N/A")}, Bio: {user_inputs.get("biomarkers", "N/A")} Findings Summary: Drugs: {drug_summary_part} Trials: {trial_summary_part} Synthesize into brief (3-4 sentences) conclusion. 1. Acknowledge exploration. 2. State counts found. 3. Reiterate this is NOT medical advice. 4. Emphasize CRITICAL need to discuss ALL options with qualified provider."""
-    summary = generate_llm_response(client, model_id, system_prompt, user_prompt, max_tokens=350, temperature=0.3)
-    logging.info(f"LLM final summary: {summary}")
-    # Add final mandatory reminder
-    reminder = "\n\n**Reminder:** Discuss these informational findings thoroughly with your healthcare provider before making any decisions."
-    return summary + reminder
-
-# --- Streamlit App ---
-
-st.set_page_config(page_title="AI Drug & Trial Match", layout="wide", initial_sidebar_state="expanded")
-
-# --- Load Data and Model (Initialization) ---
-data_loaded_successfully = False
+# --- Global Data Initialization ---
+DATA_LOADED_SUCCESSFULLY = False
 try:
-    with st.spinner("Initializing resources... This may take a moment on first run."):
-        embedding_model = load_sentence_transformer_model()
-        df_drugs_processed = load_and_preprocess_drug_data(DRUG_DATA_CSV)
-        drug_embeddings_array = get_or_generate_drug_embeddings(df_drugs_processed, embedding_model)
-        df_trials_processed = load_and_preprocess_trial_data(TRIAL_DATA_XLSX)
-        trial_embeddings_array, trial_index_map = get_or_generate_trial_embeddings(df_trials_processed, embedding_model)
+    embedding_model_global = load_sentence_transformer_model()
+    df_drugs_processed_global = load_and_preprocess_drug_data(DRUG_DATA_CSV)
+    drug_embeddings_array_global = get_or_generate_drug_embeddings(df_drugs_processed_global, embedding_model_global)
+    df_trials_processed_global = load_and_preprocess_trial_data(TRIAL_DATA_XLSX)
+    trial_embeddings_array_global, trial_index_map_global = get_or_generate_trial_embeddings(df_trials_processed_global, embedding_model_global)
+    DATA_LOADED_SUCCESSFULLY = True
+    logging.info("All critical data and models initialized successfully.")
+    if NOMINATIM_USER_AGENT == "ai_drug_trial_matcher_app/1.1": # Default placeholder
+        st.sidebar.warning(
+            "**Geocoding Alert:**\n\n"
+            "The `NOMINATIM_USER_AGENT` is set to a default value. "
+            "Please update it in the script to a unique identifier for your application "
+            "(e.g., 'YourAppName/1.0 yourcontact@example.com') to ensure reliable geocoding services."
+        )
 
-    if drug_embeddings_array.size > 0 and trial_embeddings_array.size > 0 and trial_index_map is not None:
-        data_loaded_successfully = True
-        logging.info("All resources initialized successfully.")
-    else:
-        logging.error("Failed to initialize embeddings or index map.")
-        st.error("Failed to initialize necessary data embeddings. Cannot proceed.")
-except Exception as e:
-    logging.critical("App initialization failed.", exc_info=True)
+except RuntimeError as e:
+    st.error(
+        f"🚨 **APPLICATION STARTUP FAILED** 🚨\n\n"
+        f"A critical error occurred during data or model initialization:\n\n`{e}`\n\n"
+        "Please check the console logs for more details and ensure all data files are correctly placed and formatted. "
+        "The application cannot continue."
+    )
+    logging.critical(f"Application startup failed due to: {e}", exc_info=True)
+    # DATA_LOADED_SUCCESSFULLY remains False
+    # The main app logic below will check this flag.
 
-# --- Initialize Session State ---
-def initialize_session():
-    if 'stage' not in st.session_state:
-        logging.info("Initializing new session state.")
-        st.session_state.stage = STAGES["INIT"]
-        st.session_state.user_inputs = {}
-        st.session_state.messages = []
-        st.session_state.drug_results = []
-        st.session_state.trial_results = []
-        st.session_state.consent_given = None
-        # Processing flags
-        st.session_state.drug_results_processed = False
-        st.session_state.trial_results_processed = False
-        st.session_state.contact_saved = False
-        st.session_state.final_summary_processed = False
-        # Configurable thresholds
-        st.session_state.drug_threshold = DRUG_RELEVANCE_THRESHOLD_DEFAULT
-        st.session_state.trial_threshold = TRIAL_RELEVANCE_THRESHOLD_DEFAULT
-        # Default Model
-        if 'model_id' not in st.session_state:
-            st.session_state.model_id = DEFAULT_MODEL_ID
+# --- Dynamic Top-N Selection ---
+def _determine_top_n_results(scored_results_list):
+    if not scored_results_list: return 0
+    count = len(scored_results_list)
+    if count <= 10: return count
+    
+    # Score of the 10th item (0-indexed), ensure it exists
+    score_at_10th = scored_results_list[9]['semantic_similarity'] if count > 9 else 0 
 
-        # Initial prompts based on successful loading
-        if data_loaded_successfully:
-             st.session_state.messages.append({"role": "assistant", "content": STAGE_PROMPTS[STAGES["INIT"]], "type": "info"})
-             st.session_state.messages.append({"role": "assistant", "content": STAGE_PROMPTS[STAGES["GET_DIAGNOSIS"]]})
-             st.session_state.stage = STAGES["GET_DIAGNOSIS"]
+    if score_at_10th >= 0.7: return min(count, 20)
+    if score_at_10th < 0.5: return 10
+    # Interpolate or use a midpoint for scores between 0.5 and 0.7
+    return min(count, 15) # Simplified: 10 if low, 15 mid, 20 high
+
+# --- Geocoding Cache ---
+def load_persistent_geocode_cache(filepath=GEOCODE_CACHE_FILE_PATH):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r') as f: return json.load(f)
+        except: pass
+    return {}
+
+def save_persistent_geocode_cache(cache_data, target_path=GEOCODE_CACHE_FILE_PATH, temp_path=TEMP_GEOCODE_CACHE_FILE_PATH):
+    try:
+        with open(temp_path, 'w') as f: json.dump(cache_data, f, indent=2)
+        if os.path.exists(target_path): os.remove(target_path)
+        os.rename(temp_path, target_path)
+    except Exception as e:
+        logging.warning(f"Could not save geocode cache: {e}")
+
+# --- Langchain Tools Definition ---
+class FindDrugsInput(BaseModel):
+    diagnosis: str = Field(description="The primary diagnosis, e.g., Breast Cancer")
+    stage: str = Field(description="The stage or progression, e.g., Stage IV, Metastatic")
+    biomarkers: str = Field(description="Known biomarkers, comma-separated, or 'None', e.g., HR-positive, PD-L1 high")
+
+@tool("find_drugs_tool", args_schema=FindDrugsInput)
+def find_drugs_tool(diagnosis: str, stage: str, biomarkers: str) -> str:
+    """
+    Finds relevant drug studies based on user's diagnosis, stage, and biomarkers.
+    Returns a JSON string containing a list of top matching drugs with their details and similarity scores.
+    The LLM should review these for relevance before presenting to the user.
+    """
+    logging.info(f"Tool: find_drugs_tool: Dx='{diagnosis}', Stg='{stage}', Bio='{biomarkers}'")
+    if drug_embeddings_array_global.size == 0:
+        return json.dumps({"error": "Drug data or embeddings are not available.", "drugs": []})
+
+    query = f"{diagnosis} {stage} {biomarkers}".strip()
+    if not query: return json.dumps({"error": "Drug search query is empty.", "drugs": []})
+
+    try:
+        q_emb = embedding_model_global.encode(query, convert_to_numpy=True)
+        sims = cosine_similarity([q_emb], drug_embeddings_array_global)[0]
+    except Exception as e:
+        logging.error(f"Drug embedding/similarity error: {e}")
+        return json.dumps({"error": f"Error during drug similarity calculation: {e}", "drugs": []})
+
+    results = []
+    for i, row in df_drugs_processed_global.iterrows():
+        if i >= len(sims): continue
+        if sims[i] >= 0.3: # Initial broad filter
+            results.append({
+                'drug_name': row.get('Drug Name', 'N/A'),
+                'cancer_type_studied': row.get('Cancer Type', 'N/A'), # Clarify this is from study
+                'treatment_os': row.get('Treatment_OS', 'N/A'),
+                'control_os': row.get('Control_OS', 'N/A'),
+                'os_improvement_percent': row.get('OS_Improvement (%)', 'N/A'),
+                'brief_summary': textwrap.shorten(str(row.get('Brief Study Summary', '')), 200),
+                'semantic_similarity': round(float(sims[i]), 3),
+                'source_data_index': i
+            })
+    results.sort(key=lambda x: x['semantic_similarity'], reverse=True)
+    
+    num_to_select = _determine_top_n_results(results)
+    final_results = results[:num_to_select]
+    
+    if not final_results:
+        return json.dumps({"message": "No drug studies found closely matching the criteria after dynamic selection.", "drugs": []})
+    return json.dumps({"drugs": final_results, "count": len(final_results)})
+
+class FindClinicalTrialsInput(BaseModel):
+    diagnosis: str = Field(description="Primary diagnosis, e.g., Lung Cancer")
+    stage: str = Field(description="Stage/progression, e.g., Advanced, Recurrent")
+    biomarkers: str = Field(description="Biomarkers (comma-separated or 'None'), e.g., EGFR mutation")
+    user_latitude: float = Field(None, description="User's latitude. Optional.")
+    user_longitude: float = Field(None, description="User's longitude. Optional.")
+    radius_miles: int = Field(DEFAULT_SEARCH_RADIUS_MILES, description="Search radius in miles. Optional.")
+
+@tool("find_clinical_trials_tool", args_schema=FindClinicalTrialsInput)
+def find_clinical_trials_tool(diagnosis: str, stage: str, biomarkers: str, user_latitude: float = None, user_longitude: float = None, radius_miles: int = DEFAULT_SEARCH_RADIUS_MILES) -> str:
+    """
+    Finds relevant clinical trials based on diagnosis, stage, biomarkers, and optionally location.
+    Filters for Overall Survival, specific phases, and interventional type.
+    Returns JSON string of top trials with details, similarity, and distance if applicable.
+    LLM should review for relevance.
+    """
+    logging.info(f"Tool: find_clinical_trials_tool: Dx='{diagnosis}', Stg='{stage}', Bio='{biomarkers}', Loc=({user_latitude},{user_longitude}), Rad={radius_miles}")
+    if trial_embeddings_array_global.size == 0 or not trial_index_map_global:
+        return json.dumps({"error": "Trial data, embeddings, or map unavailable.", "trials": []})
+
+    query = f"{diagnosis} {stage} {biomarkers}".strip()
+    if not query: return json.dumps({"error": "Trial search query empty.", "trials": []})
+    
+    user_loc = (user_latitude, user_longitude) if user_latitude is not None and user_longitude is not None else None
+
+    try: q_emb = embedding_model_global.encode(query, convert_to_numpy=True)
+    except Exception as e:
+        logging.error(f"Trial query embedding error: {e}")
+        return json.dumps({"error": f"Error embedding trial query: {e}", "trials": []})
+
+    results = []
+    for i, row in df_trials_processed_global.iterrows():
+        if not (str(row.get(TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN, '')).lower().count(TRIAL_FILTER_PRIMARY_OUTCOME_TERM.lower()) > 0 and \
+                check_phases(str(row.get(TRIAL_FILTER_PHASES_COLUMN, ''))) and \
+                str(row.get(TRIAL_FILTER_STUDY_TYPE_COLUMN, '')).upper() == TRIAL_FILTER_STUDY_TYPE_VALUE.upper() and \
+                i in trial_index_map_global and trial_index_map_global[i] < len(trial_embeddings_array_global)):
+            continue
+        
+        sim = cosine_similarity([q_emb], [trial_embeddings_array_global[trial_index_map_global[i]]])[0][0]
+        if sim < 0.3: continue # Initial broad filter
+
+        trial_info = {
+            'nct_id': row.get('NCT Number', 'N/A'),
+            'title': textwrap.shorten(str(row.get('Study Title', '')), 150),
+            'status': row.get('Study Status', 'N/A'), 'phases': row.get(TRIAL_FILTER_PHASES_COLUMN, 'N/A'),
+            'semantic_similarity': round(float(sim), 3),
+            'url': f"https://clinicaltrials.gov/study/{row.get('NCT Number', '')}" if row.get('NCT Number', 'N/A') != 'N/A' else None,
+            'distance_miles': None, 'closest_site_coords': None, 'source_data_index': i
+        }
+
+        if user_loc:
+            trial_sites = row.get('parsed_location_coordinates', [])
+            min_dist = float('inf')
+            closest_site = None
+            for site_coords in trial_sites:
+                try:
+                    dist = geodesic(user_loc, site_coords).miles
+                    if dist < min_dist: min_dist, closest_site = dist, site_coords
+                except: pass # Ignore malformed site coords for distance calc
+            
+            if min_dist <= radius_miles:
+                trial_info.update({'distance_miles': round(min_dist, 1), 'closest_site_coords': closest_site})
+                results.append(trial_info)
+            # If location search but no results yet, add closest ones even if outside radius for consideration by LLM
+            elif not any(r['distance_miles'] is not None for r in results) and min_dist != float('inf'):
+                 trial_info.update({'distance_miles': round(min_dist, 1), 'closest_site_coords': closest_site})
+                 results.append(trial_info)
         else:
-             st.session_state.messages.append({"role": "assistant", "content": "⚠️ Application initialization failed. Cannot proceed.", "type": "error"})
-             st.session_state.stage = STAGES["END"]
+            results.append(trial_info)
+            
+    if user_loc: results.sort(key=lambda x: (sort_key_with_none(x['distance_miles'], False), -x['semantic_similarity']))
+    else: results.sort(key=lambda x: x['semantic_similarity'], reverse=True)
 
-    # Ensure core keys exist if session persists partially
-    keys_defaults = {
-        'user_inputs': {}, 'drug_results': [], 'trial_results': [], 'consent_given': None,
-        'messages': [], 'model_id': DEFAULT_MODEL_ID, 'drug_threshold': DRUG_RELEVANCE_THRESHOLD_DEFAULT,
-        'trial_threshold': TRIAL_RELEVANCE_THRESHOLD_DEFAULT, 'drug_results_processed': False,
-        'trial_results_processed': False, 'contact_saved': False, 'final_summary_processed': False
-    }
-    for key, default_val in keys_defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = default_val
+    num_to_select = _determine_top_n_results(results)
+    final_results = results[:num_to_select]
 
-initialize_session()
+    if not final_results:
+        return json.dumps({"message": "No trials found closely matching criteria after dynamic selection.", "trials": []})
+    return json.dumps({"trials": final_results, "count": len(final_results)})
+
+
+class ZipToCoordinatesInput(BaseModel):
+    zip_code: str = Field(description="User's zip code, e.g., 90210")
+    country_code: str = Field("US", description="Country code for the zip code, e.g., US, CA. Defaults to US.")
+
+@tool("zip_to_coordinates_tool", args_schema=ZipToCoordinatesInput)
+def zip_to_coordinates_tool(zip_code: str, country_code: str = "US") -> str:
+    """
+    Converts zip code to geographic coordinates (latitude, longitude).
+    Uses a persistent cache. Returns JSON with coordinates or error.
+    """
+    logging.info(f"Tool: zip_to_coordinates_tool: Zip='{zip_code}', Country='{country_code}'")
+    cache = load_persistent_geocode_cache()
+    key = f"{zip_code}_{country_code}".lower()
+    if key in cache and cache[key]:
+        logging.info(f"Zip cache hit for '{key}'. Coords: {cache[key]}")
+        return json.dumps({"latitude": cache[key][0], "longitude": cache[key][1], "status": "success_cache"})
+
+    geolocator = Nominatim(user_agent=NOMINATIM_USER_AGENT)
+    warning_msg = ""
+    if NOMINATIM_USER_AGENT == "ai_drug_trial_matcher_app/1.1": # Default placeholder
+         warning_msg = "Warning: Nominatim user agent is default. Geocoding may be unreliable. "
+
+    try:
+        time.sleep(API_REQUEST_DELAY_SECONDS)
+        loc = geolocator.geocode(f"{zip_code}, {country_code}", timeout=API_TIMEOUT_SECONDS)
+        if loc:
+            coords = (loc.latitude, loc.longitude)
+            cache[key] = coords
+            save_persistent_geocode_cache(cache)
+            logging.info(f"Geocoded '{key}' to {coords}. Saved to cache.")
+            return json.dumps({"latitude": coords[0], "longitude": coords[1], "status": "success_api"})
+        logging.warning(f"Could not geocode zip: {zip_code}, {country_code}")
+        return json.dumps({"error": f"{warning_msg}Could not geocode zip code: {zip_code}", "status": "error_not_found"})
+    except (GeocoderTimedOut, GeocoderUnavailable) as e:
+        logging.error(f"Geocoding service issue for zip {zip_code}: {e}")
+        return json.dumps({"error": f"{warning_msg}Geocoding service issue: {e}", "status": "error_service_unavailable"})
+    except Exception as e:
+        logging.error(f"Error geocoding zip {zip_code}: {e}")
+        return json.dumps({"error": f"{warning_msg}Unexpected geocoding error: {e}", "status": "error_unknown"})
+
+available_tools = [find_drugs_tool, find_clinical_trials_tool, zip_to_coordinates_tool]
+
+# --- Langchain Agent Setup ---
+# --- Langchain Agent Setup ---
+@st.cache_resource
+def get_langchain_agent_executor():
+    # System prompt carefully crafted for Claude Tool Use and desired behavior
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """You are a highly specialized AI assistant for exploring information about cancer drugs and clinical trials. Your primary goal is to provide relevant, summarized information to users based on their input.
+
+Key Responsibilities:
+1.  **Information Gathering:** Collect necessary details from the user: diagnosis, stage, and any known biomarkers. Be clear if information is missing.
+2.  **Tool Utilization:**
+    *   Use `find_drugs_tool` to find drug studies.
+    *   Use `find_clinical_trials_tool` to find clinical trials. This tool applies initial filters (Overall Survival outcome, specific phases, interventional type).
+    *   If trials are discussed and the user expresses interest in location, ask for their zip code (and country, defaulting to US). Then, use `zip_to_coordinates_tool` to get coordinates. Re-invoke `find_clinical_trials_tool` with these coordinates.
+3.  **Critical Review & Summarization (VERY IMPORTANT):**
+    *   After a tool returns data (JSON string of drugs/trials), YOU MUST carefully review the items for relevance to the user's stated diagnosis, stage, and biomarkers.
+    *   Do NOT just dump the raw tool output. Select the most relevant items.
+    *   Explain your reasoning for highlighting certain results or if many results seem weakly relevant.
+    *   Summarize key findings from the selected items. For drugs: name, studied cancer, OS/PFS improvement if notable. For trials: NCT ID, title, status, phase, and distance (if applicable).
+4.  **Formatting:**
+    *   Present information clearly using markdown (bolding, lists, etc.).
+    *   Make drug and trial summaries easy to read. For example:
+        **Drug: [Drug Name]** (Similarity: [Score])
+        *   Studied for: [Cancer Type]
+        *   Key Outcome: [e.g., Improved Overall Survival by X months]
+        *   Summary: [Brief summary from data]
+
+        **Trial: [NCT ID] - [Title]** (Similarity: [Score], Distance: [Dist] miles if applicable)
+        *   Status: [Status], Phase: [Phase]
+        *   URL: [Link to clinicaltrials.gov]
+5.  **Disclaimer:** ALWAYS remind the user that you are NOT providing medical advice. All information is for exploration and MUST be discussed with a qualified healthcare provider. This is critical.
+6.  **Follow-up Suggestions:** At the end of your substantive responses, suggest 2-3 relevant follow-up questions the user might have. Format them clearly:
+    **Next, you could ask:**
+    1. [Suggestion 1 about a specific drug/trial, or a general next step]
+    2. [Suggestion 2]
+    3. [Suggestion 3]
+7.  **Tone:** Maintain a friendly, empathetic, professional, and cautious tone.
+8.  **Error Handling:** If a tool returns an error or no results, inform the user gracefully. Suggest trying different phrasing or providing more details.
+9.  **Conciseness:** Be informative but avoid excessively long responses. Focus on the most relevant information.
+If the user's query is too vague, ask for clarification (e.g., "Could you please specify the diagnosis you're interested in?").
+Do not answer questions outside the scope of drug and clinical trial information for cancer.
+You have access to tools that can help you find drug and clinical trial information. Use them when appropriate.
+Your final answer to the user should be a complete thought, incorporating information from tool usage if any.
+""", # MODIFIED: Removed the explicit "<tools>{tools}</tools>" placeholder
+            ),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("user", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"), # For tool calls and observations
+        ]
+    )
+    # ... rest of the function remains the same
+    llm = ChatAnthropic(model=CLAUDE_MODEL_NAME, temperature=0.2, api_key=ANTHROPIC_API_KEY, max_tokens_to_sample=3000) # max_tokens for Claude 2, max_tokens_to_sample or just max_tokens for Claude 3
+    agent = create_tool_calling_agent(llm, available_tools, prompt_template)
+    agent_executor = AgentExecutor(agent=agent, tools=available_tools, verbose=True, handle_parsing_errors=True, max_iterations=10)
+    return agent_executor
+
+# --- Streamlit UI ---
+# Initialize session state variables
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "chat_history_for_agent" not in st.session_state:
+    st.session_state.chat_history_for_agent = [] # Stores AIMessage, HumanMessage objects
+if "agent_executor" not in st.session_state and DATA_LOADED_SUCCESSFULLY:
+    st.session_state.agent_executor = get_langchain_agent_executor()
+if "current_input" not in st.session_state: # To handle suggested prompts
+    st.session_state.current_input = ""
+
 
 # --- Sidebar ---
 with st.sidebar:
-    st.subheader("⚙️ Configuration")
-    # LLM Model Selector
-    model_display_names = list(AVAILABLE_MODELS.keys())
-    current_model_display_name = next((name for name, mid in AVAILABLE_MODELS.items() if mid == st.session_state.model_id), DEFAULT_MODEL_DISPLAY_NAME)
-    try: default_index = model_display_names.index(current_model_display_name)
-    except ValueError: default_index = 0
-    selected_model_display_name = st.selectbox(
-        "LLM Model:", options=model_display_names, index=default_index, key="model_select_widget",
-        help="AI model for summaries/explanations."
-    )
-    new_model_id = AVAILABLE_MODELS[selected_model_display_name]
-    if new_model_id != st.session_state.model_id:
-        st.session_state.model_id = new_model_id; st.toast(f"LLM Model: {selected_model_display_name}", icon="🤖")
-        logging.info(f"LLM Model updated to {new_model_id}")
-
-    st.caption(f"Embedding: `{EMBEDDING_MODEL_NAME}`")
+    st.title("AI Assistant Controls")
     st.divider()
-    # Similarity Threshold Sliders
-    st.session_state.drug_threshold = st.slider(
-        "Drug Relevance Threshold", min_value=0.0, max_value=1.0,
-        value=st.session_state.drug_threshold, step=0.05,
-        help="Minimum similarity score (0-1) for a drug study to be considered relevant. Higher is stricter."
-    )
-    st.session_state.trial_threshold = st.slider(
-        "Trial Relevance Threshold", min_value=0.0, max_value=1.0,
-        value=st.session_state.trial_threshold, step=0.05,
-        help="Minimum similarity score (0-1) for a clinical trial to be considered relevant after filtering. Higher is stricter."
-    )
-    st.divider()
-    # Restart Button
-    if st.button("🔄 Restart Conversation", key="restart_sidebar"):
-        logging.info("Restarting session from sidebar.")
-        keys_to_clear = [k for k in st.session_state.keys() if k not in ['model_id', 'model_select_widget']] # Keep LLM choice
-        for key in keys_to_clear: del st.session_state[key]
-        initialize_session()
-        st.rerun()
-    st.divider()
-    st.markdown("---")
-    st.caption("Status Info:")
-    current_stage_num = st.session_state.get('stage', STAGES["INIT"])
-    st.write(f"Stage: {STAGE_NAMES.get(current_stage_num, 'Unknown')}")
-    st.write(f"Initialized: {'✅' if data_loaded_successfully else '❌'}")
-
-# --- Main App Area ---
-
-# Header Section (Not sticky, but at the top)
-st.title("🧑‍⚕️ AI Drug & Trial Match")
-# st.caption("Explore information from study data. Discuss all findings with your healthcare provider.")
-
-# Chat messages area (renders directly into the main flow)
-message_container = st.container() # Use a container just for logical grouping if needed, but not for height/scroll
-with message_container:
-    for message in st.session_state.get('messages', []):
-        avatar = ASSISTANT_AVATAR if message["role"] == "assistant" else USER_AVATAR
-        with st.chat_message(name=message["role"], avatar=avatar):
-            if message.get("type") == "expander":
-                with st.expander(message.get("title", "Details"), expanded=message.get("expanded", False)):
-                    st.markdown(message["content"], unsafe_allow_html=True)
-            elif message.get("type") == "info": st.info(message["content"])
-            elif message.get("type") == "warning": st.warning(message["content"])
-            elif message.get("type") == "error": st.error(message["content"])
-            else: st.markdown(message["content"], unsafe_allow_html=True)
-
-
-# --- Stage Advancement & Input/Button Logic --- (Placed after messages)
-
-def advance_stage(next_stage):
-    logging.info(f"Advancing stage: {STAGE_NAMES.get(st.session_state.stage)} -> {STAGE_NAMES.get(next_stage)}")
-    st.session_state.stage = next_stage
-    prompt = STAGE_PROMPTS.get(next_stage)
-    is_internal = next_stage in [STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]
-    if prompt and not is_internal and next_stage != STAGES["END"]: # Only add prompts for user-facing stages
-        msg = {"role": "assistant", "content": prompt}
-        if not st.session_state.messages or st.session_state.messages[-1].get("content") != prompt:
-             st.session_state.messages.append(msg)
-
-# Input/Button Area Logic
-current_stage = st.session_state.stage
-
-# Consent Buttons
-if current_stage == STAGES["ASK_CONSENT"]:
-    st.write(STAGE_PROMPTS.get(STAGES["ASK_CONSENT"]))
-    cols = st.columns([1, 1, 6])
-    with cols[0]:
-        if st.button("✔️ Yes", key="consent_yes"):
-            st.session_state.consent_given = True; st.session_state.messages.append({"role": "user", "content": "A: Yes"})
-            advance_stage(STAGES["GET_NAME"]); st.rerun()
-    with cols[1]:
-         if st.button("❌ No", key="consent_no"):
-            st.session_state.consent_given = False; st.session_state.messages.append({"role": "user", "content": "A: No"})
-            context_data = {k: st.session_state.user_inputs.get(k, "N/A") for k in ["diagnosis", "stage", "biomarkers", "prior_treatment", "imaging"]}
-            context_data["ConsentGiven"] = False; save_user_data(context_data)
-            advance_stage(STAGES["SHOW_TRIALS_NO_CONSENT"]); st.rerun()
-
-# Text Input Stages
-elif current_stage not in [STAGES["ASK_CONSENT"], STAGES["END"], STAGES["PROCESS_INFO_SHOW_DRUGS"], STAGES["SAVE_CONTACT_SHOW_TRIALS"], STAGES["SHOW_TRIALS_NO_CONSENT"], STAGES["FINAL_SUMMARY"]]:
-    prompt_text = STAGE_PROMPTS.get(current_stage, "Enter response...")
-    placeholder = re.search(r"\((e\.g\.,.*?)\)", prompt_text)
-    placeholder = placeholder.group(1) if placeholder else "Your answer..."
-    user_input = st.chat_input(placeholder=placeholder, key=f"chat_input_{current_stage}")
-    if user_input:
-        st.session_state.messages.append({"role": "user", "content": f"A: {user_input}"})
-        next_stage = None
-        if current_stage == STAGES["GET_DIAGNOSIS"]: st.session_state.user_inputs['diagnosis'] = user_input.strip(); next_stage = STAGES["GET_STAGE"]
-        elif current_stage == STAGES["GET_STAGE"]: st.session_state.user_inputs['stage'] = user_input.strip(); next_stage = STAGES["GET_BIOMARKERS"]
-        elif current_stage == STAGES["GET_BIOMARKERS"]: st.session_state.user_inputs['biomarkers'] = user_input.strip(); next_stage = STAGES["GET_PRIOR_TREATMENT"]
-        elif current_stage == STAGES["GET_PRIOR_TREATMENT"]: st.session_state.user_inputs['prior_treatment'] = user_input.strip(); next_stage = STAGES["GET_IMAGING"]
-        elif current_stage == STAGES["GET_IMAGING"]: st.session_state.user_inputs['imaging'] = user_input.strip(); next_stage = STAGES["PROCESS_INFO_SHOW_DRUGS"]
-        elif current_stage == STAGES["GET_NAME"]: st.session_state.user_inputs['name'] = user_input.strip(); next_stage = STAGES["GET_EMAIL"]
-        elif current_stage == STAGES["GET_EMAIL"]:
-            if "@" not in user_input or "." not in user_input.split('@')[-1]: st.session_state.messages.append({"role": "assistant", "content": "⚠️ Please enter a valid email.", "type":"warning"})
-            else: st.session_state.user_inputs['email'] = user_input.strip(); next_stage = STAGES["GET_PHONE"]
-        elif current_stage == STAGES["GET_PHONE"]: st.session_state.user_inputs['phone'] = user_input.strip() if user_input.strip() else "N/A"; next_stage = STAGES["SAVE_CONTACT_SHOW_TRIALS"]
-        if next_stage is not None: advance_stage(next_stage); st.rerun()
-
-# Processing Stages
-elif current_stage == STAGES["PROCESS_INFO_SHOW_DRUGS"]:
-    if not st.session_state.get("drug_results_processed", False):
-        with st.spinner("Finding relevant drug studies..."):
-            user_inputs = st.session_state.user_inputs
-            try:
-                # Use threshold from session state
-                st.session_state.drug_results = find_relevant_drugs_local(
-                    df_drugs=df_drugs_processed, drug_embeddings=drug_embeddings_array, model=embedding_model,
-                    user_cancer_type_raw=user_inputs.get("diagnosis", ""), user_stage_raw=user_inputs.get("stage", ""),
-                    user_biomarkers_raw=user_inputs.get("biomarkers", ""),
-                    relevance_threshold=st.session_state.drug_threshold, # Use state value
-                    max_results=MAX_DRUGS_TO_DISPLAY
-                )
-                with st.spinner("Generating summary & interpretations..."):
-                    drug_list_summary = generate_drug_summary_llm(user_inputs, st.session_state.drug_results, st.session_state.model_id)
-                    st.session_state.messages.append({"role": "assistant", "content": f"**Drug Study Findings:**\n\n{drug_list_summary}"})
-                    if st.session_state.drug_results:
-                        st.session_state.messages.append({"role": "assistant", "content": f"Details for top {len(st.session_state.drug_results)} studies:", "type": "info"})
-                        for i, drug in enumerate(st.session_state.drug_results):
-                            interpretation = generate_result_interpretation_llm("drug", drug, user_inputs, st.session_state.model_id)
-                            title = f"#{i+1}: {drug.get('Drug Name', 'N/A')} (Rel: {drug.get('semantic_similarity', 0):.2f})"
-                            content = f"**Drug:** {drug.get('Drug Name', 'N/A')}\n**Study Cancer Type:** {drug.get('Cancer Type', 'N/A')}\n"
-                            content += f"**Outcomes:** OS Tx:`{drug.get('Treatment_OS', 'N/A')}` vs Ctrl:`{drug.get('Control_OS', 'N/A')}` ({drug.get('OS_Improvement (%)', 'N/A')}); PFS Tx:`{drug.get('Treatment_PFS', 'N/A')}` vs Ctrl:`{drug.get('Control_PFS', 'N/A')}` ({drug.get('PFS_Improvement (%)', 'N/A')})\n\n"
-                            google_url = f"https://www.google.com/search?q={drug.get('Drug Name', '').replace(' ', '+')}+{drug.get('Cancer Type', '').replace(' ', '+')}+clinical+study"
-                            content += f"🔗 [Search Google]({google_url})\n\n**AI Interpretation:**\n> {interpretation}\n"
-                            st.session_state.messages.append({"role": "assistant", "content": content, "type": "expander", "title": title, "expanded": i < 1})
-                st.session_state.drug_results_processed = True
-                advance_stage(STAGES["ASK_CONSENT"]); st.rerun()
-            except Exception as e:
-                logging.error("Error during drug processing:", exc_info=True); st.error(f"Drug analysis error: {e}")
-                st.session_state.messages.append({"role": "assistant", "content": "Could not complete drug analysis.", "type": "error"})
-                st.session_state.drug_results_processed = True; advance_stage(STAGES["ASK_CONSENT"]); st.rerun()
-
-elif current_stage == STAGES["SAVE_CONTACT_SHOW_TRIALS"]:
-    if st.session_state.consent_given is True and not st.session_state.get("contact_saved", False):
-        contact_data = {k: st.session_state.user_inputs.get(k, "N/A") for k in ["name", "email", "phone", "diagnosis", "stage", "biomarkers", "prior_treatment", "imaging"]}
-        contact_data["ConsentGiven"] = True
-        if save_user_data(contact_data): st.toast("Contact info recorded.", icon="✅"); st.session_state.messages.append({"role": "assistant", "content": "Contact info recorded.", "type": "info"})
-        else: st.toast("Failed to save contact info.", icon="⚠️"); st.session_state.messages.append({"role": "assistant", "content": "⚠️ Issue saving contact info.", "type": "warning"})
-        st.session_state.contact_saved = True
-    advance_stage(STAGES["SHOW_TRIALS_NO_CONSENT"]); st.rerun()
-
-elif current_stage == STAGES["SHOW_TRIALS_NO_CONSENT"]:
-    if not st.session_state.get("trial_results_processed", False):
-        with st.spinner("Finding relevant clinical trials..."):
-            user_inputs = st.session_state.user_inputs
-            try:
-                # Use threshold from session state
-                st.session_state.trial_results = find_relevant_trials_local(
-                    df_trials=df_trials_processed, trial_embeddings=trial_embeddings_array, index_to_embedding_index=trial_index_map, model=embedding_model,
-                    user_cancer_type_raw=user_inputs.get("diagnosis", ""), user_stage_raw=user_inputs.get("stage", ""),
-                    user_biomarkers_raw=user_inputs.get("biomarkers", ""),
-                    relevance_threshold=st.session_state.trial_threshold, # Use state value
-                    max_results=MAX_TRIALS_TO_DISPLAY
-                )
-                with st.spinner("Generating summary & interpretations..."):
-                    trial_list_summary = generate_trial_summary_llm(user_inputs, st.session_state.trial_results, st.session_state.model_id)
-                    st.session_state.messages.append({"role": "assistant", "content": f"**Clinical Trial Findings:**\n\n{trial_list_summary}"})
-                    if st.session_state.trial_results:
-                        st.session_state.messages.append({"role": "assistant", "content": f"Details for top {len(st.session_state.trial_results)} trials:", "type": "info"})
-                        for i, trial in enumerate(st.session_state.trial_results):
-                            interpretation = generate_result_interpretation_llm("trial", trial, user_inputs, st.session_state.model_id)
-                            title = f"#{i+1}: {trial.get('nct_id', 'N/A')} - {trial.get('status', 'N/A')} (Rel: {trial.get('semantic_similarity', 0):.2f})"
-                            content = f"**NCT ID:** {trial.get('nct_id', 'N/A')} | **Title:** {trial.get('title', 'N/A')}\n"
-                            content += f"**Status:** `{trial.get('status', 'N/A')}` | **Phase:** `{trial.get('phases', 'N/A')}`\n"
-                            content += f"**Conditions:** {trial.get('conditions', 'N/A')} | **Intervention(s):** {trial.get('interventions', 'N/A')}\n\n"
-                            if trial.get('url', '#') != '#': content += f"🔗 [View on ClinicalTrials.gov]({trial.get('url')})\n\n"
-                            content += f"**AI Interpretation:**\n> {interpretation}\n"
-                            st.session_state.messages.append({"role": "assistant", "content": content, "type": "expander", "title": title, "expanded": i < 1})
-                st.session_state.trial_results_processed = True
-                advance_stage(STAGES["FINAL_SUMMARY"]); st.rerun()
-            except Exception as e:
-                logging.error("Error during trial processing:", exc_info=True); st.error(f"Trial analysis error: {e}")
-                st.session_state.messages.append({"role": "assistant", "content": "Could not complete trial analysis.", "type": "error"})
-                st.session_state.trial_results_processed = True; advance_stage(STAGES["FINAL_SUMMARY"]); st.rerun()
-
-elif current_stage == STAGES["FINAL_SUMMARY"]:
-    if not st.session_state.get("final_summary_processed", False):
-        with st.spinner("Generating final summary..."):
-            try:
-                final_summary = generate_final_summary_llm(st.session_state.user_inputs, st.session_state.drug_results, st.session_state.trial_results, st.session_state.model_id)
-                st.session_state.messages.append({"role": "assistant", "content": f"**Final Summary:**\n\n{final_summary}"})
-            except Exception as e:
-                 logging.error("Error generating final summary", exc_info=True); st.error(f"Final summary generation error: {e}")
-                 st.session_state.messages.append({"role": "assistant", "content": "Could not generate final summary.", "type": "error"})
-        st.session_state.final_summary_processed = True
-        advance_stage(STAGES["END"]); st.rerun()
-
-# End Stage - Display final message and restart button
-elif current_stage == STAGES["END"]:
-    end_prompt_text = STAGE_PROMPTS.get(STAGES["END"])
-    # Ensure end message is the last one
-    if not st.session_state.messages or st.session_state.messages[-1].get("content") != end_prompt_text:
-        st.session_state.messages.append({"role": "assistant", "content": end_prompt_text, "type": "info"})
-        st.rerun()
+    
+    if DATA_LOADED_SUCCESSFULLY:
+        if st.button("🔄 Restart Conversation", use_container_width=True, type="primary"):
+            st.session_state.messages = []
+            st.session_state.chat_history_for_agent = []
+            # Re-initialize agent if it has internal state beyond memory passed in invoke
+            # For stateless agents where history is passed explicitly, this might not be strictly needed
+            # but good for ensuring a clean slate.
+            st.session_state.agent_executor = get_langchain_agent_executor() 
+            st.session_state.current_input = ""
+            st.success("Conversation restarted!")
+            st.rerun()
     else:
-        # Display restart button only after the end message is shown
-        st.info("Use the sidebar or button below to start a new exploration.")
-        if st.button("🔄 Start New Exploration", key="restart_main"):
-            logging.info("Restarting session from main button.")
-            keys_to_clear = [k for k in st.session_state.keys() if k not in ['model_id', 'model_select_widget']]
-            for key in keys_to_clear: del st.session_state[key]
-            initialize_session(); st.rerun()
+        st.warning("Application data failed to load. Restart is unavailable.")
+
+    st.divider()
+    st.subheader("About this Assistant")
+    st.info(
+        "This AI assistant helps you explore information about cancer drugs and clinical trials. "
+        "It uses advanced language models and search techniques on curated datasets."
+    )
+    st.warning(
+        "**Disclaimer:** The information provided is for general knowledge and informational purposes only, "
+        "and does not constitute medical advice. It is essential to consult with a qualified healthcare "
+        "professional for any health concerns or before making any decisions related to your health or treatment."
+    )
+    st.caption(f"Claude Model: `{CLAUDE_MODEL_NAME}` | Embedding: `{EMBEDDING_MODEL_NAME}`")
+
+
+# --- Main Chat Interface ---
+st.header("AI Drug & Trial Information Assistant")
+
+if DATA_LOADED_SUCCESSFULLY:
+    # Display chat messages
+    for message in st.session_state.messages:
+        avatar = ASSISTANT_AVATAR if message["role"] == "assistant" else USER_AVATAR
+        with st.chat_message(message["role"], avatar=avatar):
+            st.markdown(message["content"], unsafe_allow_html=True) # Allow HTML for rich formatting from LLM
+
+    # Handle suggested questions by populating current_input
+    suggested_prompt_clicked = False
+    if "clicked_suggestion" in st.session_state and st.session_state.clicked_suggestion:
+        st.session_state.current_input = st.session_state.clicked_suggestion
+        st.session_state.clicked_suggestion = None # Reset after use
+        suggested_prompt_clicked = True
+
+
+    # Chat input from user
+    user_prompt = st.chat_input("Ask about drugs or clinical trials for a diagnosis...", key="main_chat_input")
+    
+    if suggested_prompt_clicked: # If a suggestion was clicked, use that as prompt
+        process_prompt = st.session_state.current_input
+        st.session_state.current_input = "" # Clear after use
+    elif user_prompt:
+        process_prompt = user_prompt
+    else:
+        process_prompt = None
+
+    if process_prompt:
+        st.session_state.messages.append({"role": "user", "content": process_prompt})
+        with st.chat_message("user", avatar=USER_AVATAR):
+            st.markdown(process_prompt)
+
+        with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+            message_placeholder = st.empty()
+            full_response_content = ""
+            with st.spinner("🧑‍⚕️ Thinking..."):
+                try:
+                    agent_input = {
+                        "input": process_prompt,
+                        "chat_history": st.session_state.chat_history_for_agent
+                    }
+                    response_data = st.session_state.agent_executor.invoke(agent_input)
+                    ai_response_content = response_data.get("output", "I apologize, I couldn't process that.")
+                    
+                    full_response_content = ai_response_content
+                    
+                    # Update Langchain-specific chat history
+                    st.session_state.chat_history_for_agent.append(HumanMessage(content=process_prompt))
+                    st.session_state.chat_history_for_agent.append(AIMessage(content=ai_response_content))
+                    
+                    # Limit history to avoid excessive token usage (e.g., last K interactions)
+                    max_history_pairs = 7 # Keep last 7 pairs of user/AI messages
+                    if len(st.session_state.chat_history_for_agent) > max_history_pairs * 2:
+                        st.session_state.chat_history_for_agent = st.session_state.chat_history_for_agent[-(max_history_pairs * 2):]
+
+                except Exception as e:
+                    logging.error(f"Error during agent invocation: {e}", exc_info=True)
+                    full_response_content = f"Sorry, I encountered an error: {str(e)[:200]}... Please try rephrasing or restarting."
+                    # Also add this error to Langchain history so it's aware
+                    st.session_state.chat_history_for_agent.append(HumanMessage(content=process_prompt))
+                    st.session_state.chat_history_for_agent.append(AIMessage(content=f"Error encountered by system: {e}"))
+            
+            message_placeholder.markdown(full_response_content, unsafe_allow_html=True)
+        
+        st.session_state.messages.append({"role": "assistant", "content": full_response_content})
+
+        # Extract and display suggested prompts as buttons
+        suggestion_match = re.search(r"\*\*Next, you could ask:\*\*\s*\n(.*?)(?=\n\n|\Z)", full_response_content, re.DOTALL | re.IGNORECASE)
+        if suggestion_match:
+            suggestions_block = suggestion_match.group(1).strip()
+            suggestion_lines = [re.sub(r"^\s*\d+\.\s*", "", line).strip() for line in suggestions_block.split('\n') if line.strip()]
+            
+            if suggestion_lines:
+                st.subheader("Suggested Follow-up Questions:")
+                cols = st.columns(len(suggestion_lines))
+                for i, suggestion_text in enumerate(suggestion_lines):
+                    if cols[i].button(suggestion_text, key=f"suggestion_{i}_{time.time()}", use_container_width=True): # Unique key
+                        st.session_state.clicked_suggestion = suggestion_text
+                        st.rerun()
+        # This rerun is essential if a prompt was processed.
+        # If it was a user_prompt, it's fine. If it was from a suggestion, this ensures the UI updates.
+        if suggested_prompt_clicked:
+             st.rerun()
+
+
+    # Initial greeting if no messages and data loaded successfully
+    if not st.session_state.messages and DATA_LOADED_SUCCESSFULLY:
+        initial_greeting = (
+            "Hello! I'm your AI assistant for exploring information about cancer drugs and clinical trials. "
+            "How can I assist you today? For example, you can tell me about a diagnosis like 'Stage IV Lung Cancer with EGFR mutation'."
+        )
+        st.session_state.messages.append({"role": "assistant", "content": initial_greeting})
+        st.session_state.chat_history_for_agent.append(AIMessage(content=initial_greeting))
+        st.rerun()
+
+elif not DATA_LOADED_SUCCESSFULLY:
+    # This message is displayed if DATA_LOADED_SUCCESSFULLY is False after the initial load attempt.
+    # The more specific error from the loading block should already be visible.
+    st.warning("The application could not start correctly due to issues loading essential data or models. Please review any error messages above and check your setup.")
+
+st.caption("This is an AI-powered informational tool. Always consult a healthcare professional for medical advice.")

@@ -1,73 +1,117 @@
-import os
-from dotenv import load_dotenv
-from groq import Groq, RateLimitError, APIError
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
-load_dotenv()
+# Sample data (replace with your Excel file path)
+data = {
+    'NCT Number': ['NCT05394337', 'NCT01203722', 'NCT04521413', 'NCT06150417', 'NCT04673175'],
+    'Study Title': [
+        'Neoadjuvant PD-1 Plus TIGIT Blockade in Patients With Cisplatin-Ineligible Operable High-Risk Urothelial Carcinoma',
+        'Reduced Intensity, Partially HLA Mismatched BMT to Treat Hematologic Malignancies',
+        'Safety and Efficacy Study of CFI-402411 in Subjects With Advanced Solid Malignancies',
+        'MDRT in Prostate Cancer Treated With Long-term Androgen Deprivation Therapy in the STAMPEDE Trial (METANOVA)',
+        'Ceftolozane-Tazobactam for Directed Treatment of Pseudomonas Aeruginosa Bacteremia and Pneumonia in Patients With Hematological Malignancies and Hematopoietic Stem Cell Transplantation'
+    ]
+}
+df = pd.DataFrame(data)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# Uncomment the line below and replace 'path_to_file.xlsx' with your actual Excel file path
+# df = pd.read_excel('path_to_file.xlsx')
 
+# Function to extract condition from study title
+def extract_condition(title):
+    split_phrases = ["in Patients With", "for", "to Treat", "in Subjects With"]
+    for phrase in split_phrases:
+        if phrase in title:
+            parts = title.split(phrase)
+            return parts[-1].strip()
+    return title  # Fallback to full title if no split phrase is found
 
-def get_llm_client():
-    """Initializes and returns the Groq client."""
-    try:
-        return Groq(api_key=GROQ_API_KEY)
-    except Exception as e:
-        print("error: ", e)
-        # logging.critical(f"Failed to initialize Groq client: {e}", exc_info=True)
-        # st.error("FATAL ERROR: Could not initialize AI client. Please check configuration.")
-        # st.stop() # Halt app if client can't be initialized
+# Extract conditions from study titles
+conditions = df['Study Title'].apply(extract_condition).tolist()
 
+# Load BioBERT model
+print("Loading BioBERT model...")
+model = SentenceTransformer('dmis-lab/biobert-base-cased-v1.1')
 
+# Precompute embeddings for conditions
+print("Computing embeddings for study conditions...")
+condition_embeddings = model.encode(conditions)
 
-def generate_ctgov_keywords_llm(diagnosis, stage_info, biomarkers):
-    """Uses LLM to generate a clean JSON array of keywords and phrases for ClinicalTrials.gov query.term."""
+# Function to find relevant studies based on user input
+def find_relevant_studies(user_input, top_n=3):
+    # Compute embedding for user input
+    user_embedding = model.encode([user_input])[0]
+    # Calculate cosine similarities
+    similarities = cosine_similarity([user_embedding], condition_embeddings)[0]
+    # Get indices of top matches
+    top_indices = np.argsort(similarities)[::-1][:top_n]
+    # Collect results
+    results = []
+    for idx in top_indices:
+        study_title = df['Study Title'].iloc[idx]
+        similarity = similarities[idx]
+        results.append((study_title, similarity))
+    return results
+
+# Test the program with example queries
+def test_program():
+    test_queries = [
+        "urothelial carcinoma",
+        "prostate cancer",
+        "hematologic malignancies",
+        "stage IV bladder cancer"
+    ]
     
-    client = get_llm_client()
-    prompt = f"""
-    Take the following patient information and build clinicaltrials api query.titles search parameter 
-    return very important keywords connected by term 'OR' 
-    User Information:
-    Diagnosis: "{diagnosis}"
-    Stage/Progression: "{stage_info}"
-    Biomarkers: "{biomarkers}"
+    for query in test_queries:
+        print(f"\nQuery: '{query}'")
+        print("Top matching studies:")
+        results = find_relevant_studies(query)
+        for title, sim in results:
+            print(f"  - {title} (Similarity: {sim:.4f})")
 
-    here is information for you 
-    
-    1. The primary cancer type (e.g., "lung cancer", "breast cancer"). Quote multi-word types.
-    2. Relevant specific subtypes (e.g., "non-small cell", "adenocarcinoma"). 
-    3. Significant biomarkers as quoted phrases or single terms (e.g., "EGFR mutation", "HER2 positive", "PD-L1").
-    4. "metastatic" or related terms if the stage indicates spread.
-
-    Exclude from the array:
-    - Full sentences or questions.
-    - Any introductory or explanatory text (like "Here is the list...", "Note that...", etc.).
-    - Any conversational elements.
-
-    Output ONLY the SEARCH PARAMETER VALUE
-    AVOID STARTING OR ENDING SENTENCES 
-    DONT COMMENT ON YOUR RESPONSE
-    DONT EXPLAIN YOUR ANSWER 
-    
-    !IMPORTANT ONLY RESPOND THE SEARCH VALUES
-
-    Example output: "Breast Cancer OR STAGE III"
-    
-    Output:
+def test_program(find_relevant_studies):
     """
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "You are clinicalstrials api search parameter writer."},
-                {"role": "user", "content": prompt}
-            ],
-            model="llama3-8b-8192", temperature=0.3, max_tokens=300,
-            
-        )
-        response_content = chat_completion.choices[0].message.content
-        # logging.info(f"LLM raw CT.gov keywords response: {response_content}")
+    Test the study matching program with various scenarios.
+    Args:
+        find_relevant_studies: Function that takes a query and returns [(title, similarity_score), ...]
+    """
+    test_queries = [
+        "Non-small cell lung cancer type",  # Specific cancer type
+        "urothelial carcinoma",             # Matches sample data NCT05394337
+        "prostate cancer",                  # Matches sample data NCT06150417
+        "hematologic malignancies",         # Matches sample data NCT01203722, NCT04673175
+        "solid tumors",                     # Matches sample data NCT04521413
+        "bladder cancer",                   # Related to urothelial carcinoma
+        "lung cancer",                      # General cancer type
+        "stage IV urothelial carcinoma",    # Stage-specific
+        "PD-1 blockade",                    # Biomarker/treatment
+        "advanced lung cancer with EGFR mutation",  # Multi-element query
+        "metastatic breast cancer",         # Stage and cancer type
+        "relapsed lymphoma",                # Progression state
+        "leukemia",                         # No match in sample data
+        "cancer",                           # Very general query
+        "lung cancr",                       # Misspelling
+        "pulmonary carcinoma"               # Synonym for lung cancer
+    ]
+    
+    for query in test_queries:
+        print(f"\nQuery: '{query}'")
+        print("Top matching studies:")
+        try:
+            results = find_relevant_studies(query)
+            if results:
+                for title, sim in results:
+                    print(f"  - {title} (Similarity: {sim:.4f})")
+            else:
+                print("    No matches found.")
+        except Exception as e:
+            print(f"    Error processing query: {e}")
 
-        return response_content
-    except Exception as e:
-        print("Exception2: ", e)
-
-print(generate_ctgov_keywords_llm("Non-small cell lung adenocarcinoma", "Stage IV, metastatic to liver and brain", "EGFR Exon 19 deletion positive"))
+# Example usage (uncomment and replace with your actual function)
+# from your_module import find_relevant_studies
+# test_program(find_relevant_studies)
+# Run the test
+if __name__ == "__main__":
+    test_program()

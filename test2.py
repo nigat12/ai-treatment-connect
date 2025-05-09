@@ -1,108 +1,43 @@
-import requests
-import pandas as pd
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
 
-# Initial URL for the first API call
-base_url = "https://clinicaltrials.gov/api/v2/studies"
-fields_to_request = [
-        "NCTId", # IdentificationModule
-        "BriefTitle", # Study
-        "OverallStatus", # StatusModule
-        "Phase", # DesignModule
-        "Condition", # ConditionsModule
-        "BriefSummary", # DescriptionModule
-        "StudyType", # DesignModule
-        "InterventionList", # InterventionModule (for names)
-        "EligibilityCriteria", # EligibilityModule (for snippet)
-        "LocationList", # ContactsLocationsModule (for snippet)
-        
-    ]
-params = {
-    
-    "query.term": '"Invasive Ductal Carcinoma" OR "Breast Cancer" OR "Stage IIB" OR "node-positive" OR "ER positive" OR "PR positive" OR "HER2 negative"',
-    "pageSize": 10,
-    'format': 'json',
-}
+# 1. The address string
+address = "Arizona Cancer Center at UMC North, Tucson, Arizona, 85719, United States"
 
+# 2. Initialize the geolocator
+geolocator = Nominatim(user_agent="my_geocoder_application_v1.1") # Update version or app name
 
+try:
+    # 3. Geocode the address
+    location = geolocator.geocode(address, timeout=10)
 
+    # 4. Print the results and generate Google Maps link
+    if location:
+        print(f"Input Address: {address}")
+        print(f"Found Address: {location.address}")
+        print(f"Latitude: {location.latitude}")
+        print(f"Longitude: {location.longitude}")
 
-# Initialize an empty list to store the data
-data_list = []
+        # Generate Google Maps link
+        latitude = location.latitude
+        longitude = location.longitude
+        google_maps_link_simple = f"https://www.google.com/maps?q={latitude},{longitude}"
+        google_maps_link_search = f"https://www.google.com/maps/search/?api=1&query={latitude},{longitude}"
+        google_maps_link_zoom = f"https://www.google.com/maps/@{latitude},{longitude},17z" # 17z is a good zoom level
 
-count = 0
-# Loop until there is no nextPageToken
-while True:
-    
-    if count == 10:
-        break
-    
-    count = count + 1
-    # Print the current URL (for debugging purposes)
-    print("Fetching data from:", base_url + '?' + '&'.join([f"{k}={v}" for k, v in params.items()]))
-    
-    # Send a GET request to the API
-    response = requests.get(base_url, params=params)
+        print(f"\n--- Google Maps Links ---")
+        print(f"Simple Link: {google_maps_link_simple}")
+        print(f"Search Link (often good for markers): {google_maps_link_search}")
+        print(f"Link with Zoom: {google_maps_link_zoom}")
 
-    # Check if the request was successful
-    if response.status_code == 200:
-        data = response.json()  # Parse JSON response
-        studies = data.get('studies', [])  # Extract the list of studies
-
-        # Loop through each study and extract specific information
-        for study in studies:
-            # Safely access nested keys
-            nctId = study['protocolSection']['identificationModule'].get('nctId', 'Unknown')
-            overallStatus = study['protocolSection']['statusModule'].get('overallStatus', 'Unknown')
-            startDate = study['protocolSection']['statusModule'].get('startDateStruct', {}).get('date', 'Unknown Date')
-            conditions = ', '.join(study['protocolSection']['conditionsModule'].get('conditions', ['No conditions listed']))
-            acronym = study['protocolSection']['identificationModule'].get('acronym', 'Unknown')
-
-            # Extract interventions safely
-            interventions_list = study['protocolSection'].get('armsInterventionsModule', {}).get('interventions', [])
-            interventions = ', '.join([intervention.get('name', 'No intervention name listed') for intervention in interventions_list]) if interventions_list else "No interventions listed"
-            
-            # Extract locations safely
-            locations_list = study['protocolSection'].get('contactsLocationsModule', {}).get('locations', [])
-            locations = ', '.join([f"{location.get('city', 'No City')} - {location.get('country', 'No Country')}" for location in locations_list]) if locations_list else "No locations listed"
-            
-            # Extract dates and phases
-            primaryCompletionDate = study['protocolSection']['statusModule'].get('primaryCompletionDateStruct', {}).get('date', 'Unknown Date')
-            studyFirstPostDate = study['protocolSection']['statusModule'].get('studyFirstPostDateStruct', {}).get('date', 'Unknown Date')
-            lastUpdatePostDate = study['protocolSection']['statusModule'].get('lastUpdatePostDateStruct', {}).get('date', 'Unknown Date')
-            studyType = study['protocolSection']['designModule'].get('studyType', 'Unknown')
-            phases = ', '.join(study['protocolSection']['designModule'].get('phases', ['Not Available']))
-
-            # Append the data to the list as a dictionary
-            data_list.append({
-                "NCT ID": nctId,
-                "Acronym": acronym,
-                "Overall Status": overallStatus,
-                "Start Date": startDate,
-                "Conditions": conditions,
-                "Interventions": interventions,
-                "Locations": locations,
-                "Primary Completion Date": primaryCompletionDate,
-                "Study First Post Date": studyFirstPostDate,
-                "Last Update Post Date": lastUpdatePostDate,
-                "Study Type": studyType,
-                "Phases": phases
-            })
-
-        # Check for nextPageToken and update the params or break the loop
-        nextPageToken = data.get('nextPageToken')
-        if nextPageToken:
-            params['pageToken'] = nextPageToken  # Set the pageToken for the next request
-        else:
-            break  # Exit the loop if no nextPageToken is present
     else:
-        print("Failed to fetch data. Status code:", response.status_code)
-        break
+        print(f"Location not found for: {address}")
 
-# Create a DataFrame from the list of dictionaries
-df = pd.DataFrame(data_list)
-
-# Print the DataFrame
-print(df)
-
-# Optionally, save the DataFrame to a CSV file
-# df.to_csv("clinical_trials_data_complete.csv", index=False)
+except GeocoderTimedOut:
+    print("Error: Geocoding service timed out.")
+except GeocoderUnavailable:
+    print("Error: Geocoding service unavailable. Check your internet connection or the service status.")
+except Exception as e:
+    print(f"An unexpected error occurred: {e}")
+    
+# https://www.google.com/maps?q=32.2643805,-110.9497108
