@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-# --------------------------------------------------------------------------
-# AI Cancer Information Assistant (Based on User's v2.0 - Robust Suggestions)
-# Improved version with proper markdown rendering of output text
-# --------------------------------------------------------------------------
-
-# 1. SET PAGE CONFIG FIRST
 import streamlit as st
 st.set_page_config(
     page_title="AI Cancer Info Assistant",
@@ -12,18 +5,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
-        'Get Help': 'mailto:help@example.com', # Replace
-        'Report a bug': "mailto:bugs@example.com", # Replace
-        'About': """
-        ## AI Cancer Information Assistant
-        This tool helps explore information about cancer drugs and clinical trials.
-        **Important Disclaimer:** This tool is for informational purposes ONLY and is NOT medical advice.
-        Always consult with your doctor or a qualified healthcare professional.
-        """
+    
     }
 )
 
-# --- Standard Library Imports ---
+
 import os
 import json
 import logging
@@ -31,12 +17,11 @@ import re
 import time
 import pickle
 import math
-import ast # <<<< MAKE SURE AST IS IMPORTED (it was already in your original code)
+import ast 
 from datetime import datetime
 import textwrap
-from typing import List, Dict, Any, Optional, Tuple # Added for clarity
+from typing import List, Dict, Any, Optional, Tuple 
 
-# --- Third-party Library Imports ---
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
@@ -54,7 +39,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.pydantic_v1 import BaseModel, Field
 
-# --- Application Configuration & Setup ---
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(name)s - %(module)s - %(funcName)s - Line %(lineno)d - %(message)s',
@@ -63,14 +48,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-# --- API Key Check ---
+
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY:
     st.error("🚨 **CRITICAL ERROR: ANTHROPIC_API_KEY is not configured!** Application cannot start.")
     logger.critical("ANTHROPIC_API_KEY not found. Application cannot proceed.")
     st.stop()
 
-# --- File Paths & Constants (From user's v_old) ---
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DRUG_DATA_CSV = os.path.join(BASE_DIR, 'drug_data.csv')
 TRIAL_DATA_XLSX = os.path.join(BASE_DIR, 'trials_filtered_with_coordinates.xlsx')
@@ -84,11 +69,11 @@ EMBEDDING_MODEL_NAME = 'neuml/pubmedbert-base-embeddings'
 DRUG_TEXT_COLUMNS_FOR_EMBEDDING = ['Cancer Type', 'Drug Name']
 TRIAL_TEXT_COLUMNS_FOR_EMBEDDING = ['Study Title', 'Conditions']
 
-TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN = 'Primary Outcome Measures' # Not used in v_old trial filter logic, but kept definition
-TRIAL_FILTER_PRIMARY_OUTCOME_TERM = 'Overall Survival' # Not used in v_old trial filter logic
+TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN = 'Primary Outcome Measures' 
+TRIAL_FILTER_PRIMARY_OUTCOME_TERM = 'Overall Survival' 
 
 TRIAL_FILTER_PHASES_COLUMN = 'Phases'
-# Using phase list from v_old as user stated it was working
+
 TRIAL_ACCEPTABLE_PHASES_STR = ['PHASE1|PHASE2', 'PHASE2', 'PHASE2|PHASE3', 'PHASE3', 'PHASE4']
 TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES = set()
 for phase_combo in TRIAL_ACCEPTABLE_PHASES_STR:
@@ -98,22 +83,21 @@ for phase_combo in TRIAL_ACCEPTABLE_PHASES_STR:
 TRIAL_FILTER_STUDY_TYPE_COLUMN = 'Study Type'
 TRIAL_FILTER_STUDY_TYPE_VALUE = 'INTERVENTIONAL'
 
-CLAUDE_MODEL_NAME = "claude-3-5-haiku-20241022" # Updated to current model
+CLAUDE_MODEL_NAME = "claude-3-5-haiku-20241022"
 DEFAULT_SEARCH_RADIUS_MILES = 50
-NOMINATIM_USER_AGENT = "AI_Cancer_Info_Assistant/1.0" # !! PLEASE UPDATE !!
+NOMINATIM_USER_AGENT = "AI_Cancer_Info_Assistant/1.0" 
 API_REQUEST_DELAY_SECONDS = 1.05
-API_TIMEOUT_SECONDS = 15 # From user's v_old
+API_TIMEOUT_SECONDS = 15 
 
 ASSISTANT_AVATAR = "🧑‍⚕️"
 USER_AVATAR = "👤"
 
-# --- Helper Functions (From user's v_old) ---
 def parse_time_to_months(time_str: Any) -> Optional[float]:
     if isinstance(time_str, (int, float)) and not math.isnan(time_str): return float(time_str)
     if not isinstance(time_str, str): return None
     time_str_cleaned = str(time_str).strip().lower()
-    if time_str_cleaned in ['n/a', 'not applicable', 'not reported', 'not reached', 'nr', '', 'nan', 'none']: return None # Added none
-    # Adjusted regex from v_old to be slightly more robust
+    if time_str_cleaned in ['n/a', 'not applicable', 'not reported', 'not reached', 'nr', '', 'nan', 'none']: return None 
+
     match_months = re.search(r'(\d+(\.\d+)?)\s*(months?|m)', time_str_cleaned)
     if match_months: return float(match_months.group(1))
     match_years = re.search(r'(\d+(\.\d+)?)\s*(years?|y)', time_str_cleaned)
@@ -129,13 +113,12 @@ def sort_key_with_none(value: Any, reverse: bool = True) -> float:
 
 def check_phases(trial_phases_raw_str: Any) -> bool:
     if not isinstance(trial_phases_raw_str, str) or not str(trial_phases_raw_str).strip(): return False
-    # Normalize spaces around separators before splitting
     normalized_phases_str = re.sub(r'\s*[|/,\s]\s*', '|', str(trial_phases_raw_str).strip().upper())
     trial_individual_phases = normalized_phases_str.split('|')
     return any(phase_part.strip() in TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES for phase_part in trial_individual_phases if phase_part.strip())
 
 
-# --- Data Loading Functions (From user's v_old, with minor error message enhancements) ---
+
 @st.cache_resource(show_spinner="Loading AI model components...")
 def load_sentence_transformer_model(model_name: str = EMBEDDING_MODEL_NAME) -> SentenceTransformer:
     try:
@@ -144,14 +127,13 @@ def load_sentence_transformer_model(model_name: str = EMBEDDING_MODEL_NAME) -> S
         return model
     except Exception as e:
         logger.error(f"Fatal error loading Sentence Transformer model '{model_name}': {e}", exc_info=True)
-        # st.error is called by the main try-except block
         raise RuntimeError(f"Failed to load essential AI model component: {model_name}. Error: {e}")
 
 @st.cache_data(show_spinner="Loading drug information database...")
 def load_and_preprocess_drug_data(csv_path: str) -> pd.DataFrame:
     try:
         df = pd.read_csv(csv_path)
-        df.columns = df.columns.str.strip() # Good practice
+        df.columns = df.columns.str.strip() 
         if not all(col in df.columns for col in DRUG_TEXT_COLUMNS_FOR_EMBEDDING):
             missing_cols = [col for col in DRUG_TEXT_COLUMNS_FOR_EMBEDDING if col not in df.columns]
             raise ValueError(f"Missing required columns for drug embedding in '{csv_path}'. Expected: {DRUG_TEXT_COLUMNS_FOR_EMBEDDING}, Missing: {missing_cols}")
@@ -183,7 +165,7 @@ def get_or_generate_drug_embeddings(_drug_df: pd.DataFrame, _model: SentenceTran
         if not texts_to_embed:
             logger.warning("No text found in drug data for embedding. Returning empty array.")
             return np.array([])
-        # Using show_progress_bar from session_state for consistency with other parts
+
         embeddings = _model.encode(texts_to_embed, show_progress_bar=st.session_state.get("show_drug_emb_prog", False), convert_to_numpy=True)
         np.save(embeddings_path, embeddings)
         logger.info(f"Drug embeddings generated and saved to file: {embeddings_path}")
@@ -206,24 +188,24 @@ def load_and_preprocess_trial_data(xlsx_path: str) -> pd.DataFrame:
             def parse_excel_coords_robust(coord_str_val: Any) -> List[Tuple[float, float]]:
                 if pd.isna(coord_str_val) or not isinstance(coord_str_val, str) or not coord_str_val.strip(): return []
                 try:
-                    # Try ast.literal_eval first as it's generally safer for Python-like structures
+                    
                     try: parsed_list = ast.literal_eval(coord_str_val)
-                    except (SyntaxError, ValueError): # If ast fails, try json after fixing quotes
+                    except (SyntaxError, ValueError): 
                         coord_str_val_fixed = coord_str_val.replace("'", "\"")
                         parsed_list = json.loads(coord_str_val_fixed)
 
                     if isinstance(parsed_list, list):
                         return [tuple(item) for item in parsed_list if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(num, (int, float)) and not math.isnan(num) for num in item)]
-                    return [] # Not a list or malformed
+                    return [] 
                 except Exception as parse_err:
                     logger.debug(f"Could not parse coordinate string: '{str(coord_str_val)[:70]}...'. Error: {parse_err}")
                     return []
             df['parsed_location_coordinates'] = df['location_coordinates'].apply(parse_excel_coords_robust)
         else:
             logger.warning("'location_coordinates' column not found in trial data. Location-based search will be impaired.")
-            df['parsed_location_coordinates'] = pd.Series([[] for _ in range(len(df))]) # Ensure column exists
+            df['parsed_location_coordinates'] = pd.Series([[] for _ in range(len(df))]) 
 
-        # Ensure other necessary columns exist or are created with 'N/A'
+    
         for col_name in [TRIAL_FILTER_PHASES_COLUMN, TRIAL_FILTER_STUDY_TYPE_COLUMN]:
             if col_name not in df.columns:
                 df[col_name] = 'N/A'
@@ -245,7 +227,7 @@ def get_or_generate_trial_embeddings(_trial_df: pd.DataFrame, _model: SentenceTr
             if (embeddings is not None and index_map is not None and
                 embeddings.shape[0] == len(index_map) and
                 embeddings.shape[1] == _model.get_sentence_embedding_dimension() and
-                (max(index_map.keys(), default=-1) < len(_trial_df) if index_map else True)): # Ensure map keys are valid for current df
+                (max(index_map.keys(), default=-1) < len(_trial_df) if index_map else True)): 
                 logger.info(f"Trial embeddings and index map loaded from cached files: {embeddings_path}, {map_path}")
                 return embeddings, index_map
             logger.warning("Cached trial embeddings/map mismatch or corrupt. Regenerating.")
@@ -260,7 +242,7 @@ def get_or_generate_trial_embeddings(_trial_df: pd.DataFrame, _model: SentenceTr
         non_empty_indices = _trial_df.index[non_empty_mask].tolist()
         texts_to_embed = _trial_df.loc[non_empty_indices, 'combined_text_for_embedding'].tolist()
         
-        if not texts_to_embed: # Should be caught by non_empty_mask.any() but double check
+        if not texts_to_embed: 
             logger.warning("Filtered trial texts to embed is empty. Returning empty results.")
             return np.array([]), {}
 
@@ -275,7 +257,7 @@ def get_or_generate_trial_embeddings(_trial_df: pd.DataFrame, _model: SentenceTr
         logger.error(f"Fatal error generating trial embeddings: {e}", exc_info=True)
         raise RuntimeError(f"Failed to prepare trial information for search. Error: {e}")
 
-# --- Global Data Initialization ---
+
 DATA_LOADED_SUCCESSFULLY = False
 embedding_model_global: Optional[SentenceTransformer] = None
 df_drugs_processed_global: Optional[pd.DataFrame] = None
@@ -285,7 +267,7 @@ trial_embeddings_array_global: Optional[np.ndarray] = None
 trial_index_map_global: Optional[Dict[int, int]] = None
 
 try:
-    if NOMINATIM_USER_AGENT == "AI_Cancer_Info_Assistant_Prod/1.0": # Check against the updated default
+    if NOMINATIM_USER_AGENT == "AI_Cancer_Info_Assistant_Prod/1.0": 
         st.sidebar.warning(
             "**Geocoding Service Alert:** Please update `NOMINATIM_USER_AGENT` in the code "
             "with your unique application name and contact email for reliable geocoding. "
@@ -303,7 +285,6 @@ try:
     if df_trials_processed_global is not None and not df_trials_processed_global.empty:
         trial_embeddings_array_global, trial_index_map_global = get_or_generate_trial_embeddings(df_trials_processed_global, embedding_model_global)
 
-    # Refined check for successful data loading
     if (embedding_model_global is not None and
         df_drugs_processed_global is not None and (drug_embeddings_array_global is not None or df_drugs_processed_global.empty) and
         df_trials_processed_global is not None and 
@@ -313,7 +294,6 @@ try:
         DATA_LOADED_SUCCESSFULLY = True
         logger.info("All critical data and AI models initialized successfully.")
     else:
-        # More specific logging about what might be missing
         if embedding_model_global is None: logger.error("Embedding model failed to load.")
         if df_drugs_processed_global is None: logger.error("Drug data failed to load.")
         if drug_embeddings_array_global is None and (df_drugs_processed_global is not None and not df_drugs_processed_global.empty) : logger.error("Drug embeddings failed to generate.")
@@ -326,23 +306,20 @@ try:
 
 except RuntimeError as e:
     st.error(f"🚨 **APPLICATION STARTUP FAILED:** `{e}`\n\nPlease check logs. The app cannot continue.")
-    logger.critical(f"Startup failed due to RuntimeError: {e}", exc_info=True) # exc_info=True for RuntimeError too
-    # st.stop() will be implicitly called if this is the top level try-except
+    logger.critical(f"Startup failed due to RuntimeError: {e}", exc_info=True) 
 
-# --- Dynamic Top-N (From user's v_old) & Geocoding Cache ---
 def _determine_top_n_results(scored_results_list: List[Dict[str, Any]]) -> int:
     if not scored_results_list: return 0
     count = len(scored_results_list)
     if count == 0: return 0
-    # Simpler logic from v_old, adjusted slightly
-    if count <= 3: return count # Show fewer by default, emphasize quality
+    if count <= 3: return count 
     
-    # Check if 'semantic_similarity' key exists, default to 0 if not
+
     score_at_3rd = scored_results_list[2].get('semantic_similarity', 0) if count > 2 else 0
     
-    if score_at_3rd >= 0.75: return min(count, 5) # If 3rd is good, show up to 5
-    if score_at_3rd < 0.6: return 3 # If 3rd is poor, stick to 3
-    return min(count, 3) # Default to top 3
+    if score_at_3rd >= 0.75: return min(count, 5) 
+    if score_at_3rd < 0.6: return 3 
+    return min(count, 3)
 
 def load_persistent_geocode_cache(filepath: str = GEOCODE_CACHE_FILE_PATH) -> Dict[str, Any]:
     if os.path.exists(filepath):
@@ -366,7 +343,7 @@ def save_persistent_geocode_cache(cache_data: Dict[str, Any], target_path: str =
         logger.warning(f"Could not save geocode cache to '{target_path}': {e}", exc_info=True)
 
 
-# --- Langchain Tools (Definitions from user's v_old) ---
+
 class FindDrugsInput(BaseModel):
     diagnosis: str = Field(description="The primary diagnosis, e.g., 'Metastatic Breast Cancer', 'Lung Adenocarcinoma'")
     stage: str = Field(description="The cancer stage, e.g., 'Stage IV', 'Recurrent', 'Advanced', 'Early Stage'")
@@ -375,7 +352,6 @@ class FindDrugsInput(BaseModel):
 
 @tool("find_drugs_tool", args_schema=FindDrugsInput)
 def find_drugs_tool(diagnosis: str, stage: str, biomarkers: str, line_of_therapy: Optional[str] = None) -> str:
-    # Docstring from v_old
     """
     Finds relevant drug information based on cancer diagnosis, stage, biomarkers, and optionally, line of therapy.
     Returns a JSON string containing a list of potential drugs with details like name, cancer type studied,
@@ -390,7 +366,7 @@ def find_drugs_tool(diagnosis: str, stage: str, biomarkers: str, line_of_therapy
         return json.dumps({"error": "Drug information database is currently unavailable. Please try again later.", "drugs": []})
 
     query_parts = [diagnosis, stage, biomarkers, line_of_therapy]
-    query_text = " ".join(filter(None, query_parts)).strip().lower() # Added lower() for consistency
+    query_text = " ".join(filter(None, query_parts)).strip().lower()
 
     if not query_text:
         logger.warning("Empty query received for find_drugs_tool.")
@@ -404,9 +380,9 @@ def find_drugs_tool(diagnosis: str, stage: str, biomarkers: str, line_of_therapy
 
     potential_results = []
     for idx, row_series in df_drugs_processed_global.iterrows():
-        if idx >= len(similarities): continue # Safeguard
+        if idx >= len(similarities): continue 
         similarity_score = similarities[idx]
-        if similarity_score >= 0.5: # Relevance threshold
+        if similarity_score >= 0.5: 
             potential_results.append({
                 'drug_name': row_series.get('Drug Name', 'N/A'),
                 'cancer_type_studied': row_series.get('Cancer Type', 'N/A'),
@@ -417,7 +393,7 @@ def find_drugs_tool(diagnosis: str, stage: str, biomarkers: str, line_of_therapy
                 'control_pfs_months': row_series.get('Control_PFS_Months_Parsed', None),
                 'brief_study_summary_text': textwrap.shorten(str(row_series.get('Brief Study Summary', '')), 300, placeholder="... (summary truncated)"),
                 'source_of_data_id': row_series.get('Source ID', 'N/A'),
-                'semantic_similarity': round(float(similarity_score), 3), # Using 3 decimal places as in v_old
+                'semantic_similarity': round(float(similarity_score), 3), 
             })
     potential_results.sort(key=lambda x: x['semantic_similarity'], reverse=True)
     num_to_select_count = _determine_top_n_results(potential_results)
@@ -440,7 +416,6 @@ class FindClinicalTrialsInput(BaseModel):
 
 @tool("find_clinical_trials_tool", args_schema=FindClinicalTrialsInput)
 def find_clinical_trials_tool(diagnosis: str, stage: str, biomarkers: str, line_of_therapy: Optional[str] = None, user_latitude: Optional[float] = None, user_longitude: Optional[float] = None, radius_miles: int = DEFAULT_SEARCH_RADIUS_MILES) -> str:
-    # Docstring from v_old
     """
     Searches for clinical trials based on diagnosis, stage, biomarkers, and optionally line of therapy and location.
     Returns a JSON string of trials with details like NCT ID, title, status, phase, conditions, interventions,
@@ -456,7 +431,7 @@ def find_clinical_trials_tool(diagnosis: str, stage: str, biomarkers: str, line_
         return json.dumps({"error": "Clinical trial information database is currently unavailable. Please try again later.", "trials": []})
 
     query_parts = [diagnosis, stage, biomarkers, line_of_therapy]
-    query_text = " ".join(filter(None, query_parts)).strip().lower() # Added lower()
+    query_text = " ".join(filter(None, query_parts)).strip().lower()
 
     if not query_text:
         logger.warning("Empty query received for find_clinical_trials_tool.")
@@ -470,25 +445,23 @@ def find_clinical_trials_tool(diagnosis: str, stage: str, biomarkers: str, line_
         return json.dumps({"error": "An internal error occurred while preparing your trial search. Please try again.", "trials": []})
 
     potential_results = []
-    # Iterating through df_trials_processed_global as in v_old
     for original_idx, row_data in df_trials_processed_global.iterrows():
         trial_phases_str = str(row_data.get(TRIAL_FILTER_PHASES_COLUMN, ''))
         study_type_str = str(row_data.get(TRIAL_FILTER_STUDY_TYPE_COLUMN, '')).upper()
 
-        # Check if this original_idx is in our valid embeddings map
         if original_idx not in trial_index_map_global:
             continue
         embedding_idx = trial_index_map_global[original_idx]
-        if embedding_idx >= len(trial_embeddings_array_global): # Safeguard
+        if embedding_idx >= len(trial_embeddings_array_global): 
             continue
 
-        # Apply filters (as in v_old)
+    
         if not (check_phases(trial_phases_str) and study_type_str == TRIAL_FILTER_STUDY_TYPE_VALUE.upper()):
             continue
         
         similarity_score = cosine_similarity([query_embedding], [trial_embeddings_array_global[embedding_idx]])[0][0]
 
-        if similarity_score < 0.5: continue # Relevance threshold
+        if similarity_score < 0.5: continue 
 
         trial_details = {
             'nct_id': row_data.get('NCT Number', 'N/A'),
@@ -508,14 +481,14 @@ def find_clinical_trials_tool(diagnosis: str, stage: str, biomarkers: str, line_
         if user_coordinates:
             trial_site_coordinates_list = row_data.get('parsed_location_coordinates', [])
             min_distance_miles = float('inf')
-            if trial_site_coordinates_list and isinstance(trial_site_coordinates_list, list): # Check it's a list
+            if trial_site_coordinates_list and isinstance(trial_site_coordinates_list, list): 
                 for site_coords_tuple in trial_site_coordinates_list:
-                    if isinstance(site_coords_tuple, tuple) and len(site_coords_tuple) == 2: # Check it's a tuple of 2
+                    if isinstance(site_coords_tuple, tuple) and len(site_coords_tuple) == 2: 
                         try:
                             current_distance = geodesic(user_coordinates, site_coords_tuple).miles
                             if current_distance < min_distance_miles:
                                 min_distance_miles = current_distance
-                        except ValueError: pass # Invalid coordinates in data
+                        except ValueError: pass 
                         except Exception as dist_err:
                             logger.debug(f"Could not calculate distance for site {site_coords_tuple} in trial {trial_details['nct_id']}: {dist_err}")
             
@@ -546,7 +519,6 @@ class ZipToCoordinatesInput(BaseModel):
 
 @tool("zip_to_coordinates_tool", args_schema=ZipToCoordinatesInput)
 def zip_to_coordinates_tool(zip_code: str, country_code: str = "US") -> str:
-    # Docstring from v_old
     """
     Converts a zip code and country code to geographic coordinates (latitude and longitude).
     Returns a JSON string with 'latitude', 'longitude', and 'status'.
@@ -554,11 +526,10 @@ def zip_to_coordinates_tool(zip_code: str, country_code: str = "US") -> str:
     """
     logger.info(f"Executing zip_to_coordinates_tool: Zip='{zip_code}', Country='{country_code}'")
     geocode_cache = load_persistent_geocode_cache()
-    cache_lookup_key = f"{zip_code}_{country_code}".lower().strip().replace(" ", "") # Sanitize key
+    cache_lookup_key = f"{zip_code}_{country_code}".lower().strip().replace(" ", "") 
 
     if cache_lookup_key in geocode_cache and geocode_cache[cache_lookup_key]:
         cached_coords = geocode_cache[cache_lookup_key]
-        # Basic validation of cached data format
         if isinstance(cached_coords, (list, tuple)) and len(cached_coords) == 2 and all(isinstance(c, (float, int)) for c in cached_coords):
             logger.info(f"Zip cache hit for '{cache_lookup_key}'. Coords: {cached_coords}")
             return json.dumps({"latitude": cached_coords[0], "longitude": cached_coords[1], "status": "success_cache"})
@@ -573,11 +544,11 @@ def zip_to_coordinates_tool(zip_code: str, country_code: str = "US") -> str:
 
     try:
         time.sleep(API_REQUEST_DELAY_SECONDS)
-        # Using dictionary for query in geocode for clarity, as per v_old's intent (though it used a string)
+        
         location_data = geolocator_service.geocode({"postalcode": zip_code, "country": country_code}, timeout=API_TIMEOUT_SECONDS)
-        if location_data and location_data.latitude is not None and location_data.longitude is not None: # Check for valid lat/lon
+        if location_data and location_data.latitude is not None and location_data.longitude is not None: 
             coordinates = (location_data.latitude, location_data.longitude)
-            geocode_cache[cache_lookup_key] = list(coordinates) # Store as list for JSON
+            geocode_cache[cache_lookup_key] = list(coordinates) 
             save_persistent_geocode_cache(geocode_cache)
             logger.info(f"Geocoded '{cache_lookup_key}' to {coordinates}. Saved to cache.")
             return json.dumps({"latitude": coordinates[0], "longitude": coordinates[1], "status": "success_api"})
@@ -596,7 +567,7 @@ def zip_to_coordinates_tool(zip_code: str, country_code: str = "US") -> str:
 
 available_tools = [find_drugs_tool, find_clinical_trials_tool, zip_to_coordinates_tool]
 
-# --- Function for Separate Suggestion Generation (From user's v_old) ---
+
 def generate_follow_up_suggestions(user_query: str, ai_main_response: str, llm_client: ChatAnthropic) -> list[str]:
     """
     Generates 2-3 relevant follow-up suggestions based on the last interaction.
@@ -604,7 +575,7 @@ def generate_follow_up_suggestions(user_query: str, ai_main_response: str, llm_c
     user_query_str = str(user_query) if user_query is not None else "The user asked a question."
     ai_main_response_str = str(ai_main_response) if ai_main_response is not None else "I provided some information."
 
-    max_len = 700 # As in v_old
+    max_len = 700 
     truncated_user_query = textwrap.shorten(user_query_str, width=max_len, placeholder="...")
     truncated_ai_response = textwrap.shorten(ai_main_response_str, width=max_len, placeholder="...")
 
@@ -614,27 +585,25 @@ def generate_follow_up_suggestions(user_query: str, ai_main_response: str, llm_c
     ]
     suggestions_list: List[str] = []
     try:
-        response = llm_client.invoke(suggestion_prompt_messages, max_tokens=200) # Added max_tokens for suggestion LLM
+        response = llm_client.invoke(suggestion_prompt_messages, max_tokens=200) 
         content = response.content
         logger.debug(f"Raw suggestions LLM response: {content}")
 
-        # Robust JSON extraction
         json_match = re.search(r"{\s*\"suggestions\"\s*:\s*(\[.*?\])\s*}", content, re.DOTALL | re.IGNORECASE)
         if json_match:
-            json_str_content = json_match.group(1) # Get just the list part
-            # Attempt to make it valid JSON if it's not perfectly formatted (e.g. trailing commas)
+            json_str_content = json_match.group(1) 
+            
             try:
-                # A common issue is single quotes from LLM, try to fix
                 json_str_content_fixed = json_str_content.replace("'", "\"")
                 suggestions_data_list = json.loads(json_str_content_fixed)
                 if isinstance(suggestions_data_list, list):
                     suggestions_list = [
                         str(s).strip() for s in suggestions_data_list
-                        if str(s).strip() and len(str(s).strip()) > 7 and str(s).strip().endswith("?") # Basic validation
-                    ][:3] # Take top 3 valid
+                        if str(s).strip() and len(str(s).strip()) > 7 and str(s).strip().endswith("?")
+                    ][:3] 
             except json.JSONDecodeError:
                 logger.warning(f"Could not decode JSON suggestions (attempt 1): {json_str_content[:200]}...")
-                # Fallback if direct parsing of list content also fails (less likely with the regex group)
+               
                 try:
                     full_json_obj_str = json_match.group(0)
                     suggestions_data_obj = json.loads(full_json_obj_str.replace("'", "\""))
@@ -647,7 +616,7 @@ def generate_follow_up_suggestions(user_query: str, ai_main_response: str, llm_c
                      logger.warning(f"Could not decode JSON suggestions (attempt 2): {json_match.group(0)[:200]}...")
 
 
-        if not suggestions_list: # Fallback to line parsing if JSON fails
+        if not suggestions_list: 
             lines = [line.strip() for line in content.split('\n') if line.strip()]
             parsed_lines = []
             for line in lines:
@@ -665,10 +634,8 @@ def generate_follow_up_suggestions(user_query: str, ai_main_response: str, llm_c
     return []
 
 
-# --- Langchain Agent Setup (From user's v_old) ---
 @st.cache_resource(show_spinner="Initializing AI Assistant...")
 def get_langchain_agent_executor_and_llm() -> Tuple[AgentExecutor, ChatAnthropic]:
-    # System Prompt from v_old
     system_prompt_content = """You are an AI Patient Information Assistant specializing in cancer drugs and clinical trials.
 Your primary goal is to have a helpful, empathetic, and clear conversation with users (patients or their loved ones) seeking information. You must adhere to the following principles and output formats STRICTLY.
 
@@ -743,7 +710,7 @@ Your primary goal is to have a helpful, empathetic, and clear conversation with 
 Remember, clarity, empathy, and accuracy (within the bounds of an informational assistant) are paramount.
 You have access to tools to fetch data. Use them thoughtfully. Your final output to the user should always be a complete, well-formatted, and patient-friendly response.
 """
-    # This prompt template is correct for tool_calling_agent and does NOT include MessagesPlaceholder(variable_name="text")
+   
     prompt_template = ChatPromptTemplate.from_messages(
         [
             SystemMessagePromptTemplate.from_template(system_prompt_content),
@@ -754,41 +721,37 @@ You have access to tools to fetch data. Use them thoughtfully. Your final output
     )
     llm = ChatAnthropic(
         model=CLAUDE_MODEL_NAME,
-        temperature=0.1, # From v_old
+        temperature=0.1, 
         api_key=ANTHROPIC_API_KEY,
-        # max_tokens_to_sample=4000, # From v_old (use max_tokens for newer SDK, but sticking to v_old)
-        # default_request_timeout=60.0 # From v_old
     )
     agent = create_tool_calling_agent(llm, available_tools, prompt_template)
     agent_executor = AgentExecutor(
         agent=agent,
         tools=available_tools,
-        verbose=st.session_state.get("agent_verbose_cb", False), # Allow dynamic verbose
+        verbose=st.session_state.get("agent_verbose_cb", False), 
         handle_parsing_errors="I apologize, I had a slight difficulty processing that. Could you please try rephrasing your request or asking in a different way?", # From v_old
-        max_iterations=10, # From v_old
-        return_intermediate_steps=False, # Standard for tool calling agent final output
-        early_stopping_method="generate" # Good practice
+        max_iterations=10, 
+        return_intermediate_steps=False,
+        early_stopping_method="generate"
     )
     logger.info("Langchain agent executor and LLM client initialized.")
     return agent_executor, llm
 
-# --- Streamlit UI & Application Logic (Based on v_old structure) ---
 
-# Initialize session state variables (safer with a helper)
 def init_session_state_var(var_name: str, default_value: Any):
     if var_name not in st.session_state:
         st.session_state[var_name] = default_value
 
 init_session_state_var("messages", [])
 init_session_state_var("chat_history_for_agent", [])
-init_session_state_var("current_input", "") # For typed input before processing
-init_session_state_var("clicked_suggestion", None) # For suggestion button clicks
-init_session_state_var("follow_up_suggestions_list", []) # To store generated suggestions
-init_session_state_var("show_drug_emb_prog", False) # Dev option
-init_session_state_var("show_trial_emb_prog", False) # Dev option
-init_session_state_var("agent_verbose_cb", False) # Dev option
+init_session_state_var("current_input", "")
+init_session_state_var("clicked_suggestion", None) 
+init_session_state_var("follow_up_suggestions_list", []) 
+init_session_state_var("show_drug_emb_prog", False) 
+init_session_state_var("show_trial_emb_prog", False) 
+init_session_state_var("agent_verbose_cb", False) 
 
-# Initialize agent and LLM client if data loaded successfully
+
 if DATA_LOADED_SUCCESSFULLY:
     if "agent_executor" not in st.session_state or "llm_client" not in st.session_state:
         try:
@@ -796,16 +759,14 @@ if DATA_LOADED_SUCCESSFULLY:
         except Exception as agent_init_e:
             st.error(f"🚨 Critical Error: Could not initialize the AI Assistant: {agent_init_e}")
             logger.critical(f"Failed to initialize agent executor and LLM: {agent_init_e}", exc_info=True)
-            DATA_LOADED_SUCCESSFULLY = False # Prevent further operations
-            # No st.stop() here, let the UI show the error and the data loading status.
-elif not DATA_LOADED_SUCCESSFULLY and "messages" not in st.session_state: # Only show this if startup *really* failed early
-     # Error messages for data loading failure are handled where DATA_LOADED_SUCCESSFULLY is set
+            DATA_LOADED_SUCCESSFULLY = False 
+           
+elif not DATA_LOADED_SUCCESSFULLY and "messages" not in st.session_state: 
      pass
 
 
-# --- Sidebar ---
 with st.sidebar:
-    st.title("AI Assistant Controls")
+    st.title("AI Assistant")
     st.markdown("---")
     if DATA_LOADED_SUCCESSFULLY:
         if st.button("🔄 Start New Conversation", use_container_width=True, type="primary", help="Clears the current chat and starts fresh."):
@@ -815,7 +776,6 @@ with st.sidebar:
             st.session_state.clicked_suggestion = None
             st.session_state.follow_up_suggestions_list = []
             try:
-                # Re-initialize agent to clear its internal state and get fresh LLM client
                 st.session_state.agent_executor, st.session_state.llm_client = get_langchain_agent_executor_and_llm()
                 logger.info("Conversation restarted by user. Agent re-initialized.")
                 st.success("New conversation started!")
@@ -827,106 +787,74 @@ with st.sidebar:
         st.warning("Data loading failed. Restart unavailable.")
     
     st.markdown("---")
-    st.subheader("Developer Options")
-    st.session_state.show_drug_emb_prog = st.checkbox("Drug embedding progress", value=st.session_state.get("show_drug_emb_prog", False))
-    st.session_state.show_trial_emb_prog = st.checkbox("Trial embedding progress", value=st.session_state.get("show_trial_emb_prog", False))
-    # Update verbose state of agent if it exists
-    new_verbose_state = st.checkbox("Agent verbose logging (console)", value=st.session_state.get("agent_verbose_cb", False))
-    if new_verbose_state != st.session_state.get("agent_verbose_cb", False):
-        st.session_state.agent_verbose_cb = new_verbose_state
-        if "agent_executor" in st.session_state and hasattr(st.session_state.agent_executor, 'verbose'):
-            st.session_state.agent_executor.verbose = new_verbose_state
-            logger.info(f"Agent verbose logging set to: {new_verbose_state}")
-        st.rerun()
 
-
-    st.markdown("---")
-    st.subheader("Important Note")
-    st.info(
-        "This AI provides information to help you learn. It is **not a substitute for medical advice** from "
-        "your doctor or other qualified healthcare professionals. Always discuss your health and treatment "
-        "options with them."
-    )
     st.caption(f"AI Model: `{CLAUDE_MODEL_NAME}`")
     st.caption(f"Embedding Model: `{EMBEDDING_MODEL_NAME}`")
-    st.caption(f"Last UI Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-
-# --- Main Chat Interface ---
-st.title(f"{ASSISTANT_AVATAR} AI Cancer Information Assistant")
-st.caption("Your guide for exploring information on cancer drugs and clinical trials. Remember to always consult your doctor for medical advice.")
+st.title(f"{ASSISTANT_AVATAR} AI Cancer Info Assistant")
 st.markdown("---")
 
 if DATA_LOADED_SUCCESSFULLY:
-    # Display chat messages
+   
     for message_data in st.session_state.messages:
         avatar_icon = ASSISTANT_AVATAR if message_data["role"] == "assistant" else USER_AVATAR
         with st.chat_message(message_data["role"], avatar=avatar_icon):
             if message_data["role"] == "assistant":
                 content_from_state = message_data["content"]
-                text_to_render = content_from_state # Default to original string
+                text_to_render = content_from_state 
 
                 parsed_data = None
-                if isinstance(content_from_state, str): # Ensure it's a string before trying to parse
+                if isinstance(content_from_state, str): 
                     try:
-                        # Try ast.literal_eval for Python literal strings (e.g., with single quotes)
+                       
                         parsed_data = ast.literal_eval(content_from_state)
-                    except (ValueError, SyntaxError, TypeError): # Added TypeError for safety with ast.literal_eval
-                        # If ast.literal_eval fails, try json.loads for strict JSON
+                    except (ValueError, SyntaxError, TypeError): 
                         try:
                             parsed_data = json.loads(content_from_state)
                         except json.JSONDecodeError:
-                            # Not a Python literal string, nor standard JSON. parsed_data remains None.
+                           
                             pass
                 
                 if parsed_data is not None:
-                    # Case 1: Parsed data is a dictionary with a 'text' key
+                   
                     if isinstance(parsed_data, dict) and 'text' in parsed_data:
-                        text_to_render = str(parsed_data['text']) # Ensure value is string for markdown
-                    # Case 2: Parsed data is a list, its first element is a dict with a 'text' key
-                    # (This handles the user's example: [{'text': "markdown_content", ...}])
+                        text_to_render = str(parsed_data['text']) 
                     elif isinstance(parsed_data, list) and \
                          len(parsed_data) > 0 and \
                          isinstance(parsed_data[0], dict) and \
                          'text' in parsed_data[0]:
-                        text_to_render = str(parsed_data[0]['text']) # Ensure value is string for markdown
-                    # Else: Parsed data doesn't match the specific structures we're looking for.
-                    # text_to_render remains content_from_state (the original string),
-                    # which will be displayed "as it is now" by st.markdown below.
+                        text_to_render = str(parsed_data[0]['text']) 
                 
-                st.markdown(text_to_render) # Render the determined text
+                st.markdown(text_to_render) 
             
             else: # User message
                 st.markdown(message_data["content"])
 
-    # Input handling logic from v_old
-    # Handle clicked suggestion by setting it as the current input for processing
+
     if st.session_state.clicked_suggestion:
         st.session_state.current_input = st.session_state.clicked_suggestion
-        st.session_state.clicked_suggestion = None # Clear after use this cycle
-        # This current_input will be picked up below as prompt_to_process
+        st.session_state.clicked_suggestion = None 
 
     user_typed_prompt_str = st.chat_input(
         "Ask me about cancer treatments, drugs, or trials...", 
         key="main_chat_input_v_old_struct",
-        disabled=(st.session_state.clicked_suggestion is not None) # Disable if a suggestion was just clicked to avoid race
+        disabled=(st.session_state.clicked_suggestion is not None) 
     )
 
     prompt_to_process: Optional[str] = None
-    if st.session_state.current_input: # Prioritize input from a clicked suggestion
+    if st.session_state.current_input: 
         prompt_to_process = st.session_state.current_input
-        st.session_state.current_input = "" # Clear after moving to prompt_to_process
+        st.session_state.current_input = "" 
     elif user_typed_prompt_str:
         prompt_to_process = user_typed_prompt_str
 
     if prompt_to_process:
-        # Add user message to display list
-        st.session_state.messages.append({"role": "user", "content": prompt_to_process})
         
-        # Add HumanMessage to agent's history (as in v_old, current message is part of history for invoke)
+        st.session_state.messages.append({"role": "user", "content": prompt_to_process})
+ 
         st.session_state.chat_history_for_agent.append(HumanMessage(content=prompt_to_process))
 
-        # Display thinking message
+
         with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
             message_response_placeholder = st.empty()
             message_response_placeholder.markdown("🧑‍⚕️ Thinking and gathering information for you...")
@@ -938,7 +866,7 @@ if DATA_LOADED_SUCCESSFULLY:
                  logger.warning("Agent executor or LLM client not in session state when processing input. Re-initializing.")
                  st.session_state.agent_executor, st.session_state.llm_client = get_langchain_agent_executor_and_llm()
 
-            # Agent invocation as in v_old (current user message is in chat_history_for_agent)
+           
             agent_invocation_input = {
                 "input": prompt_to_process,
                 "chat_history": st.session_state.chat_history_for_agent 
@@ -956,30 +884,30 @@ if DATA_LOADED_SUCCESSFULLY:
             
             final_assistant_response = str(raw_ai_output)
 
-            # Add AI response to agent's history
+           
             st.session_state.chat_history_for_agent.append(AIMessage(content=final_assistant_response))
 
-            # Prune history for agent
-            max_history_pairs_count = 7 # e.g., 7 pairs = 14 messages
+            
+            max_history_pairs_count = 7 
             if len(st.session_state.chat_history_for_agent) > max_history_pairs_count * 2:
                 st.session_state.chat_history_for_agent = st.session_state.chat_history_for_agent[-(max_history_pairs_count * 2):]
 
         except Exception as agent_error:
             logger.error(f"Critical error during agent invocation: {agent_error}", exc_info=True)
-            error_detail_snippet = str(agent_error)[:150].replace("*", "").replace("{", "").replace("}", "") # Sanitize
+            error_detail_snippet = str(agent_error)[:150].replace("*", "").replace("{", "").replace("}", "") 
             final_assistant_response = (
                 "I'm truly sorry, but I encountered a significant technical issue while trying to process your request. "
                 "The technical team has been notified of this. Please try again in a little while, or rephrase your question.\n\n"
                 f"(Technical detail for admin: {error_detail_snippet}...)"
             )
-            # Add error to history as AI response
+           
             st.session_state.chat_history_for_agent.append(AIMessage(content=f"System error during processing: {final_assistant_response}"))
 
-        # Add final AI response to display list
+        
         st.session_state.messages.append({"role": "assistant", "content": final_assistant_response})
 
-        # Generate follow-up suggestions
-        st.session_state.follow_up_suggestions_list = [] # Clear previous
+       
+        st.session_state.follow_up_suggestions_list = [] 
         if final_assistant_response and "technical issue" not in final_assistant_response.lower() and "error" not in final_assistant_response.lower():
             st.session_state.follow_up_suggestions_list = generate_follow_up_suggestions(
                 user_query=prompt_to_process,
@@ -987,26 +915,24 @@ if DATA_LOADED_SUCCESSFULLY:
                 llm_client=st.session_state.llm_client
             )
         
-        st.rerun() # Rerun to display the new user message, AI response, and then suggestions.
-
-    # Display follow-up suggestions (if any, from the previous turn)
-    if st.session_state.follow_up_suggestions_list: # Check if list has content
-        st.markdown("---") # Visual separator
+        st.rerun() 
+    if st.session_state.follow_up_suggestions_list: 
+        st.markdown("---")
         st.markdown("##### 🤔 What would you like to explore next?")
         
         num_suggestions_to_display = min(len(st.session_state.follow_up_suggestions_list), 3)
         if num_suggestions_to_display > 0:
             suggestion_columns = st.columns(num_suggestions_to_display)
             for idx, suggestion_item_text in enumerate(st.session_state.follow_up_suggestions_list[:num_suggestions_to_display]):
-                # Use a more robust key for suggestion buttons
+               
                 button_key_str = f"suggestion_btn_{idx}_{hash(suggestion_item_text)}"
                 if suggestion_columns[idx].button(f"_{suggestion_item_text}_", key=button_key_str, use_container_width=True, help=f"Click to ask: {suggestion_item_text}"):
-                    st.session_state.clicked_suggestion = suggestion_item_text # Set flag
-                    st.session_state.follow_up_suggestions_list = [] # Clear suggestions immediately after click
+                    st.session_state.clicked_suggestion = suggestion_item_text 
+                    st.session_state.follow_up_suggestions_list = []
                     logger.info(f"Suggestion clicked: '{suggestion_item_text}'")
-                    st.rerun() # Rerun to process the clicked suggestion as new input
+                    st.rerun() 
 
-    # Initial greeting if no messages and data loaded
+
     if not st.session_state.messages and DATA_LOADED_SUCCESSFULLY:
         initial_greeting_text = (
             "Hello! I'm an AI assistant here to help you explore information about cancer treatments, including "
@@ -1019,7 +945,7 @@ if DATA_LOADED_SUCCESSFULLY:
         logger.info("Initial greeting displayed to user.")
         st.rerun()
 
-elif not DATA_LOADED_SUCCESSFULLY: # If data loading failed at the start
+elif not DATA_LOADED_SUCCESSFULLY: 
     st.error(
         "🚨 **The Cancer Information Assistant could not start.**\n\n"
         "This is likely due to issues loading essential data files or configuring AI models. "
@@ -1028,6 +954,5 @@ elif not DATA_LOADED_SUCCESSFULLY: # If data loading failed at the start
     )
     logger.critical("DATA_LOADED_SUCCESSFULLY is False. Displaying startup failure message to user.")
 
-# Footer disclaimer
+
 st.markdown("---")
-st.caption("This AI tool provides information for educational purposes only and is NOT a substitute for professional medical advice, diagnosis, or treatment. Always seek the advice of your physician or other qualified health provider with any questions you may have regarding a medical condition. Never disregard professional medical advice or delay in seeking it because of something you have read from this tool.")

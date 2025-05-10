@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-# --------------------------------------------------------------------------
-# AI Cancer Information Assistant (Based on User's v2.0 - Robust Suggestions)
-# Improved version with proper markdown rendering of output text
-# --------------------------------------------------------------------------
-
-# 1. SET PAGE CONFIG FIRST
 import streamlit as st
 st.set_page_config(
     page_title="AI Cancer Info Assistant",
@@ -31,7 +24,7 @@ import re
 import time
 import pickle
 import math
-import ast
+import ast # <<<< MAKE SURE AST IS IMPORTED (it was already in your original code)
 from datetime import datetime
 import textwrap
 from typing import List, Dict, Any, Optional, Tuple # Added for clarity
@@ -84,11 +77,11 @@ EMBEDDING_MODEL_NAME = 'neuml/pubmedbert-base-embeddings'
 DRUG_TEXT_COLUMNS_FOR_EMBEDDING = ['Cancer Type', 'Drug Name']
 TRIAL_TEXT_COLUMNS_FOR_EMBEDDING = ['Study Title', 'Conditions']
 
-TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN = 'Primary Outcome Measures' # Not used in v_old trial filter logic, but kept definition
-TRIAL_FILTER_PRIMARY_OUTCOME_TERM = 'Overall Survival' # Not used in v_old trial filter logic
+TRIAL_FILTER_PRIMARY_OUTCOME_COLUMN = 'Primary Outcome Measures' 
+TRIAL_FILTER_PRIMARY_OUTCOME_TERM = 'Overall Survival' 
 
 TRIAL_FILTER_PHASES_COLUMN = 'Phases'
-# Using phase list from v_old as user stated it was working
+
 TRIAL_ACCEPTABLE_PHASES_STR = ['PHASE1|PHASE2', 'PHASE2', 'PHASE2|PHASE3', 'PHASE3', 'PHASE4']
 TRIAL_ACCEPTABLE_INDIVIDUAL_PHASES = set()
 for phase_combo in TRIAL_ACCEPTABLE_PHASES_STR:
@@ -98,16 +91,15 @@ for phase_combo in TRIAL_ACCEPTABLE_PHASES_STR:
 TRIAL_FILTER_STUDY_TYPE_COLUMN = 'Study Type'
 TRIAL_FILTER_STUDY_TYPE_VALUE = 'INTERVENTIONAL'
 
-CLAUDE_MODEL_NAME = "claude-3-5-haiku-20241022" # Updated to current model
+CLAUDE_MODEL_NAME = "claude-3-5-haiku-20241022"
 DEFAULT_SEARCH_RADIUS_MILES = 50
-NOMINATIM_USER_AGENT = "AI_Cancer_Info_Assistant/1.0" # !! PLEASE UPDATE !!
+NOMINATIM_USER_AGENT = "AI_Cancer_Info_Assistant/1.0" 
 API_REQUEST_DELAY_SECONDS = 1.05
-API_TIMEOUT_SECONDS = 15 # From user's v_old
+API_TIMEOUT_SECONDS = 15 
 
 ASSISTANT_AVATAR = "🧑‍⚕️"
 USER_AVATAR = "👤"
 
-# --- Helper Functions (From user's v_old) ---
 def parse_time_to_months(time_str: Any) -> Optional[float]:
     if isinstance(time_str, (int, float)) and not math.isnan(time_str): return float(time_str)
     if not isinstance(time_str, str): return None
@@ -827,26 +819,26 @@ with st.sidebar:
         st.warning("Data loading failed. Restart unavailable.")
     
     st.markdown("---")
-    st.subheader("Developer Options")
-    st.session_state.show_drug_emb_prog = st.checkbox("Drug embedding progress", value=st.session_state.get("show_drug_emb_prog", False))
-    st.session_state.show_trial_emb_prog = st.checkbox("Trial embedding progress", value=st.session_state.get("show_trial_emb_prog", False))
+
+    # st.session_state.show_drug_emb_prog = st.checkbox("Drug embedding progress", value=st.session_state.get("show_drug_emb_prog", False))
+    # st.session_state.show_trial_emb_prog = st.checkbox("Trial embedding progress", value=st.session_state.get("show_trial_emb_prog", False))
     # Update verbose state of agent if it exists
-    new_verbose_state = st.checkbox("Agent verbose logging (console)", value=st.session_state.get("agent_verbose_cb", False))
-    if new_verbose_state != st.session_state.get("agent_verbose_cb", False):
-        st.session_state.agent_verbose_cb = new_verbose_state
-        if "agent_executor" in st.session_state and hasattr(st.session_state.agent_executor, 'verbose'):
-            st.session_state.agent_executor.verbose = new_verbose_state
-            logger.info(f"Agent verbose logging set to: {new_verbose_state}")
-        st.rerun()
+    # new_verbose_state = st.checkbox("Agent verbose logging (console)", value=st.session_state.get("agent_verbose_cb", False))
+    # if new_verbose_state != st.session_state.get("agent_verbose_cb", False):
+    #     st.session_state.agent_verbose_cb = new_verbose_state
+    #     if "agent_executor" in st.session_state and hasattr(st.session_state.agent_executor, 'verbose'):
+    #         st.session_state.agent_executor.verbose = new_verbose_state
+    #         logger.info(f"Agent verbose logging set to: {new_verbose_state}")
+    #     st.rerun()
 
 
-    st.markdown("---")
-    st.subheader("Important Note")
-    st.info(
-        "This AI provides information to help you learn. It is **not a substitute for medical advice** from "
-        "your doctor or other qualified healthcare professionals. Always discuss your health and treatment "
-        "options with them."
-    )
+    # st.markdown("---")
+    # st.subheader("Important Note")
+    # st.info(
+    #     "This AI provides information to help you learn. It is **not a substitute for medical advice** from "
+    #     "your doctor or other qualified healthcare professionals. Always discuss your health and treatment "
+    #     "options with them."
+    # )
     st.caption(f"AI Model: `{CLAUDE_MODEL_NAME}`")
     st.caption(f"Embedding Model: `{EMBEDDING_MODEL_NAME}`")
     st.caption(f"Last UI Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -862,21 +854,41 @@ if DATA_LOADED_SUCCESSFULLY:
     for message_data in st.session_state.messages:
         avatar_icon = ASSISTANT_AVATAR if message_data["role"] == "assistant" else USER_AVATAR
         with st.chat_message(message_data["role"], avatar=avatar_icon):
-            # Render the content as markdown if it's from the assistant
             if message_data["role"] == "assistant":
-                # Handle potential JSON output by extracting 'text' field if present
-                content = message_data["content"]
-                try:
-                    # Try to parse as JSON to see if it's a tool response
-                    parsed_content = json.loads(content)
-                    if isinstance(parsed_content, dict) and 'text' in parsed_content:
-                        st.markdown(parsed_content['text'])
-                    else:
-                        st.markdown(content)
-                except json.JSONDecodeError:
-                    # Not JSON, render as is
-                    st.markdown(content)
-            else:
+                content_from_state = message_data["content"]
+                text_to_render = content_from_state # Default to original string
+
+                parsed_data = None
+                if isinstance(content_from_state, str): # Ensure it's a string before trying to parse
+                    try:
+                        # Try ast.literal_eval for Python literal strings (e.g., with single quotes)
+                        parsed_data = ast.literal_eval(content_from_state)
+                    except (ValueError, SyntaxError, TypeError): # Added TypeError for safety with ast.literal_eval
+                        # If ast.literal_eval fails, try json.loads for strict JSON
+                        try:
+                            parsed_data = json.loads(content_from_state)
+                        except json.JSONDecodeError:
+                            # Not a Python literal string, nor standard JSON. parsed_data remains None.
+                            pass
+                
+                if parsed_data is not None:
+                    # Case 1: Parsed data is a dictionary with a 'text' key
+                    if isinstance(parsed_data, dict) and 'text' in parsed_data:
+                        text_to_render = str(parsed_data['text']) # Ensure value is string for markdown
+                    # Case 2: Parsed data is a list, its first element is a dict with a 'text' key
+                    # (This handles the user's example: [{'text': "markdown_content", ...}])
+                    elif isinstance(parsed_data, list) and \
+                         len(parsed_data) > 0 and \
+                         isinstance(parsed_data[0], dict) and \
+                         'text' in parsed_data[0]:
+                        text_to_render = str(parsed_data[0]['text']) # Ensure value is string for markdown
+                    # Else: Parsed data doesn't match the specific structures we're looking for.
+                    # text_to_render remains content_from_state (the original string),
+                    # which will be displayed "as it is now" by st.markdown below.
+                
+                st.markdown(text_to_render) # Render the determined text
+            
+            else: # User message
                 st.markdown(message_data["content"])
 
     # Input handling logic from v_old
