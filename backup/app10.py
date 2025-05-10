@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # --------------------------------------------------------------------------
 # AI Cancer Information Assistant (Based on User's v2.0 - Robust Suggestions)
-# Improved version with proper markdown rendering of output text
+# This version should NOT produce the "missing 'text' variable" error
+# as its ChatPromptTemplate is correctly defined.
 # --------------------------------------------------------------------------
 
 # 1. SET PAGE CONFIG FIRST
@@ -98,9 +99,9 @@ for phase_combo in TRIAL_ACCEPTABLE_PHASES_STR:
 TRIAL_FILTER_STUDY_TYPE_COLUMN = 'Study Type'
 TRIAL_FILTER_STUDY_TYPE_VALUE = 'INTERVENTIONAL'
 
-CLAUDE_MODEL_NAME = "claude-3-5-haiku-20241022" # Updated to current model
+CLAUDE_MODEL_NAME = "claude-3-5-haiku-20241022" # From user's v_old
 DEFAULT_SEARCH_RADIUS_MILES = 50
-NOMINATIM_USER_AGENT = "AI_Cancer_Info_Assistant/1.0" # !! PLEASE UPDATE !!
+NOMINATIM_USER_AGENT = "AI_Cancer_Info_Assistant_Prod/1.0" # !! PLEASE UPDATE !!
 API_REQUEST_DELAY_SECONDS = 1.05
 API_TIMEOUT_SECONDS = 15 # From user's v_old
 
@@ -285,7 +286,7 @@ trial_embeddings_array_global: Optional[np.ndarray] = None
 trial_index_map_global: Optional[Dict[int, int]] = None
 
 try:
-    if NOMINATIM_USER_AGENT == "AI_Cancer_Info_Assistant_Prod/1.0": # Check against the updated default
+    if NOMINATIM_USER_AGENT == "AI_Cancer_Info_Assistant_Prod/1.0 (please_update@example.com)": # Check against the updated default
         st.sidebar.warning(
             "**Geocoding Service Alert:** Please update `NOMINATIM_USER_AGENT` in the code "
             "with your unique application name and contact email for reliable geocoding. "
@@ -862,22 +863,7 @@ if DATA_LOADED_SUCCESSFULLY:
     for message_data in st.session_state.messages:
         avatar_icon = ASSISTANT_AVATAR if message_data["role"] == "assistant" else USER_AVATAR
         with st.chat_message(message_data["role"], avatar=avatar_icon):
-            # Render the content as markdown if it's from the assistant
-            if message_data["role"] == "assistant":
-                # Handle potential JSON output by extracting 'text' field if present
-                content = message_data["content"]
-                try:
-                    # Try to parse as JSON to see if it's a tool response
-                    parsed_content = json.loads(content)
-                    if isinstance(parsed_content, dict) and 'text' in parsed_content:
-                        st.markdown(parsed_content['text'])
-                    else:
-                        st.markdown(content)
-                except json.JSONDecodeError:
-                    # Not JSON, render as is
-                    st.markdown(content)
-            else:
-                st.markdown(message_data["content"])
+            st.markdown(message_data["content"], unsafe_allow_html=True)
 
     # Input handling logic from v_old
     # Handle clicked suggestion by setting it as the current input for processing
